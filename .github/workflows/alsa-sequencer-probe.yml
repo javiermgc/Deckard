@@ -9,7 +9,12 @@ permissions:
 
 jobs:
   diagnose:
-    runs-on: ubuntu-22.04
+    name: Diagnose ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - name: Inspect fresh runner
@@ -26,7 +31,7 @@ jobs:
               ["modinfo", "snd_seq"], ["modinfo", "snd_dummy"],
               ["modprobe", "--dry-run", "--verbose", "snd_seq"],
               ["grep", "^snd", "/proc/modules"],
-              ["grep", "-E", "^CONFIG_(SOUND|SND|SND_SEQUENCER|SND_DUMMY)=", f"/boot/config-{kernel}"],
+              ["grep", "-E", "CONFIG_(SOUND|SND)([ =_]|$)", f"/boot/config-{kernel}"],
               ["apt-cache", "policy", f"linux-modules-{kernel}", f"linux-modules-extra-{kernel}"],
           ]
           for command in commands:
@@ -63,9 +68,11 @@ jobs:
               print(f"{command}: exit {result.returncode}", flush=True)
           for archive in pathlib.Path(".").glob("linux-modules-extra-*.deb"):
               result = subprocess.run(["dpkg-deb", "--contents", str(archive)], check=True, text=True, capture_output=True)
-              for line in result.stdout.splitlines():
-                  if "snd-seq.ko" in line or "snd-dummy.ko" in line:
-                      print(line, flush=True)
+              lines = result.stdout.splitlines()
+              matches = [line for line in lines if "/sound/" in line or "snd-seq.ko" in line or "snd-dummy.ko" in line]
+              print(f"Inspected {archive}: {len(lines)} entries; sound-related entries: {len(matches)}", flush=True)
+              for line in matches:
+                  print(line, flush=True)
       - name: Require an accessible sequencer (baseline)
         run: |
           test -c /dev/snd/seq
