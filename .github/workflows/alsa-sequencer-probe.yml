@@ -25,14 +25,18 @@ jobs:
               ["ls", "-ld", "/dev/snd", "/proc/asound", "/sys/module/snd_seq", f"/lib/modules/{kernel}"],
               ["modinfo", "snd_seq"], ["modinfo", "snd_dummy"],
               ["modprobe", "--dry-run", "--verbose", "snd_seq"],
-              ["rg", "^snd", "/proc/modules"],
-              ["rg", "^CONFIG_(SOUND|SND|SND_SEQUENCER|SND_DUMMY)=", f"/boot/config-{kernel}"],
+              ["grep", "^snd", "/proc/modules"],
+              ["grep", "-E", "^CONFIG_(SOUND|SND|SND_SEQUENCER|SND_DUMMY)=", f"/boot/config-{kernel}"],
               ["apt-cache", "policy", f"linux-modules-{kernel}", f"linux-modules-extra-{kernel}"],
           ]
           for command in commands:
               print(f"::group::{command}", flush=True)
-              result = subprocess.run(command, check=False)
-              print(f"Exit code: {result.returncode}\n::endgroup::", flush=True)
+              try:
+                  result = subprocess.run(command, check=False)
+                  print(f"Exit code: {result.returncode}", flush=True)
+              except OSError as error:
+                  print(f"Diagnostic unavailable: {error}", flush=True)
+              print("::endgroup::", flush=True)
       - name: Install ALSA diagnostic tools
         run: sudo apt-get update && sudo apt-get install -y alsa-utils
       - name: Inspect MIDI and audio availability
@@ -41,8 +45,27 @@ jobs:
           import subprocess
           for command in (["ls", "-l", "/dev/snd"], ["aconnect", "-l"], ["aplay", "-l"], ["aplay", "-L"]):
               print(f"::group::{command}", flush=True)
+              try:
+                  result = subprocess.run(command, check=False)
+                  print(f"Exit code: {result.returncode}", flush=True)
+              except OSError as error:
+                  print(f"Diagnostic unavailable: {error}", flush=True)
+              print("::endgroup::", flush=True)
+      - name: Inspect exact-kernel module package
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import subprocess
+          package = f"linux-modules-extra-{os.uname().release}"
+          for command in (["apt-cache", "policy", package], ["apt-get", "download", package]):
               result = subprocess.run(command, check=False)
-              print(f"Exit code: {result.returncode}\n::endgroup::", flush=True)
+              print(f"{command}: exit {result.returncode}", flush=True)
+          for archive in pathlib.Path(".").glob("linux-modules-extra-*.deb"):
+              result = subprocess.run(["dpkg-deb", "--contents", str(archive)], check=True, text=True, capture_output=True)
+              for line in result.stdout.splitlines():
+                  if "snd-seq.ko" in line or "snd-dummy.ko" in line:
+                      print(line, flush=True)
       - name: Require an accessible sequencer (baseline)
         run: |
           test -c /dev/snd/seq
