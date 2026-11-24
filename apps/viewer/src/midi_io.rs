@@ -978,3 +978,6 @@ mod tests {
         assert!(io.take_pending().is_empty());
     }
 }
+
+#[cfg(test)]
+mod portable_tests;
