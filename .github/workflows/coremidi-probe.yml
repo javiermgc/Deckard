@@ -1,0 +1,41 @@
+name: CoreMIDI investigation
+
+on:
+  push:
+    branches: [codex/investigate-linux-midi-ci]
+    paths:
+      - .github/workflows/coremidi-probe.yml
+      - .github/probes/coremidi.rs
+
+permissions:
+  contents: read
+
+jobs:
+  coremidi:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record runner environment
+        run: |
+          sw_vers
+          uname -m
+          printenv ImageOS ImageVersion
+          xcrun --find clang
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Build and exercise CoreMIDI through midir
+        run: |
+          mkdir -p "$RUNNER_TEMP/coremidi-probe/src"
+          cp .github/probes/coremidi.rs "$RUNNER_TEMP/coremidi-probe/src/main.rs"
+          cat > "$RUNNER_TEMP/coremidi-probe/Cargo.toml" <<'EOF'
+          [package]
+          name = "coremidi-probe"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          midir = "=0.11.1"
+          EOF
+          cp Cargo.lock "$RUNNER_TEMP/coremidi-probe/Cargo.lock"
+          cargo +1.99.1 run --manifest-path "$RUNNER_TEMP/coremidi-probe/Cargo.toml"
+          otool -L "$RUNNER_TEMP/coremidi-probe/target/debug/coremidi-probe" | grep CoreMIDI.framework
