@@ -1,0 +1,51 @@
+name: ALSA sequencer investigation
+
+on:
+  push:
+    branches: [codex/investigate-linux-midi-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Inspect fresh runner
+        shell: python
+        run: |
+          import os
+          import subprocess
+          kernel = os.uname().release
+          print({key: os.environ.get(key) for key in ("ImageOS", "ImageVersion")}, flush=True)
+          commands = [
+              ["uname", "-a"], ["id"], ["sudo", "-n", "true"],
+              ["cat", "/etc/os-release"],
+              ["ls", "-ld", "/dev/snd", "/proc/asound", "/sys/module/snd_seq", f"/lib/modules/{kernel}"],
+              ["modinfo", "snd_seq"], ["modinfo", "snd_dummy"],
+              ["modprobe", "--dry-run", "--verbose", "snd_seq"],
+              ["rg", "^snd", "/proc/modules"],
+              ["rg", "^CONFIG_(SOUND|SND|SND_SEQUENCER|SND_DUMMY)=", f"/boot/config-{kernel}"],
+              ["apt-cache", "policy", f"linux-modules-{kernel}", f"linux-modules-extra-{kernel}"],
+          ]
+          for command in commands:
+              print(f"::group::{command}", flush=True)
+              result = subprocess.run(command, check=False)
+              print(f"Exit code: {result.returncode}\n::endgroup::", flush=True)
+      - name: Install ALSA diagnostic tools
+        run: sudo apt-get update && sudo apt-get install -y alsa-utils
+      - name: Inspect MIDI and audio availability
+        shell: python
+        run: |
+          import subprocess
+          for command in (["ls", "-l", "/dev/snd"], ["aconnect", "-l"], ["aplay", "-l"], ["aplay", "-L"]):
+              print(f"::group::{command}", flush=True)
+              result = subprocess.run(command, check=False)
+              print(f"Exit code: {result.returncode}\n::endgroup::", flush=True)
+      - name: Require an accessible sequencer (baseline)
+        run: |
+          test -c /dev/snd/seq
+          test -r /dev/snd/seq
+          test -w /dev/snd/seq
+          aconnect -l
