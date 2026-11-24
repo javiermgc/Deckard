@@ -92,23 +92,16 @@ struct InputDispatch {
 }
 
 impl InputDispatch {
-    fn receive(&self, port: &str, st: &mut PortState, bytes: &[u8]) {
-        let at = Instant::now();
-        let out = self.output.lock().unwrap().clone().filter(Sender::has_engine);
-        let mut send = out.as_ref().map(|out| {
-            move |event| {
-                out.live(event);
-            }
-        });
-        self.receive_to(port, st, bytes, at, send.as_mut().map(|send| send as &mut dyn FnMut(Live)));
+    fn receive(&self, port: &Arc<str>, st: &mut PortState, bytes: &[u8]) {
+        self.receive_to(port, st, bytes, Instant::now(), None);
     }
 
-    fn receive_to(&self, port: &str, st: &mut PortState, bytes: &[u8], at: Instant, live: Option<&mut dyn FnMut(Live)>) {
-        let Self { table, pending, count, repaint, lock, lock_pending, recalls, recall_pending, remote, clock, mpe, monitor, .. } = self;
+    fn receive_to(&self, port: &Arc<str>, st: &mut PortState, bytes: &[u8], at: Instant, live: Option<&mut dyn FnMut(Live)>) {
+        let Self { count, repaint, lock, lock_pending, recalls, recall_pending, remote, clock, mpe, monitor, .. } = self;
         count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if monitor.is_open() {
-            let range = mpe.lock().unwrap().get(port).copied();
-            monitor.midi(crate::midi_monitor::Dir::In, &Arc::from(port), bytes, range);
+            let range = mpe.lock().unwrap().get(&**port).copied();
+            monitor.midi(crate::midi_monitor::Dir::In, port, bytes, range);
         }
         if let Some(sync) = SyncMsg::parse(bytes) {
             if let Some(f) = clock.lock().unwrap().as_ref() {
@@ -161,14 +154,43 @@ impl InputDispatch {
             }
         }
         // An MPE input or not, as Preferences says now.
-        let range = mpe.lock().unwrap().get(port).copied();
+        let range = mpe.lock().unwrap().get(&**port).copied();
         match (range, st.mpe.as_mut()) {
             (Some(r), Some(z)) => z.bend_range = r as f32,
             (Some(r), None) => st.mpe = Some(Mpe::new(r)),
             (None, Some(_)) => st.mpe = None,
             (None, None) => {}
         }
-        handle(table, live, pending, repaint, port, st, msg);
+        self.handle(live, port, st, msg);
+    }
+
+    /// Play an incoming message on the channels it reaches.
+    fn handle(&self, mut live: Option<&mut dyn FnMut(Live)>, port: &str, st: &mut PortState, msg: InMsg) {
+        let t = self.table.lock().unwrap();
+        // Resolve the active sender only now, as before: routing may have waited for the table.
+        let out = if live.is_none() { self.output.lock().unwrap().clone().filter(Sender::has_engine) } else { None };
+        let mut later = Vec::new();
+        for l in route(&t, st, port, msg) {
+            if let Some(send) = live.as_deref_mut() {
+                send(l);
+                continue;
+            }
+            match (&out, l) {
+                (Some(out), l) => {
+                    out.live(l);
+                }
+                // No engine yet: the notes, for the app to play.
+                (None, Live::NoteIn { group, sound, pitch, velocity, .. }) => later.push((group, sound, pitch, velocity)),
+                (None, Live::NoteRelease { group, sound, pitch }) => later.push((group, sound, pitch, 0)),
+                (None, _) => {}
+            }
+        }
+        if !later.is_empty() {
+            self.pending.lock().unwrap().extend(later);
+            if let Some(ctx) = self.repaint.lock().unwrap().as_ref() {
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -602,37 +624,6 @@ pub(crate) fn route(t: &MidiTable, st: &mut PortState, port: &str, msg: InMsg) -
     }
 }
 
-/// Play an incoming message on the channels it reaches.
-fn handle(
-    table: &Mutex<MidiTable>,
-    mut live: Option<&mut dyn FnMut(Live)>,
-    pending: &Mutex<Vec<Pending>>,
-    repaint: &Mutex<Option<eframe::egui::Context>>,
-    port: &str,
-    st: &mut PortState,
-    msg: InMsg,
-) {
-    let t = table.lock().unwrap();
-    let mut later = Vec::new();
-    for l in route(&t, st, port, msg) {
-        match (live.as_deref_mut(), l) {
-            (Some(o), l) => {
-                o(l);
-            }
-            // No engine yet: the notes, for the app to play.
-            (None, Live::NoteIn { group, sound, pitch, velocity, .. }) => later.push((group, sound, pitch, velocity)),
-            (None, Live::NoteRelease { group, sound, pitch }) => later.push((group, sound, pitch, 0)),
-            (None, _) => {}
-        }
-    }
-    if !later.is_empty() {
-        pending.lock().unwrap().extend(later);
-        if let Some(ctx) = repaint.lock().unwrap().as_ref() {
-            ctx.request_repaint();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,162 +863,14 @@ mod tests {
         assert_eq!(remote_take(true, &mapped, &[0x90, 60, 100]), None, "notes play");
         assert!(remote_take(false, &mapped, &[0xe0, 0, 0x40]).is_some());
     }
-
-    /// A mapped control from a port reaches the app, each key's last value once.
-    #[cfg(unix)]
-    #[test]
-    fn mapped_controls_come_to_the_app() {
-        let knobs_name = "DECKARD Test Knobs";
-        let Ok(knobs_out) = midir::MidiOutput::new("test knobs") else { return };
-        let Ok(mut knobs) = knobs_out.create_virtual(knobs_name) else { return };
-        let mut io = MidiIo::default();
-        io.set_remote(false, [7].into());
-        io.listen(&[knobs_name.to_string()]);
-        if io.inputs.is_empty() {
-            return;
-        }
-        for v in [10, 64, 127] {
-            knobs.send(&[0xb0, 7, v]).unwrap();
-        }
-        knobs.send(&[0xb0, 8, 1]).unwrap();
-        let mut got = Vec::new();
-        for _ in 0..100 {
-            got.extend(io.take_remote());
-            if got.iter().any(|x: &(u64, f64)| x.1 == 1.0) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(got.last(), Some(&(7, 1.0)));
-        assert!(got.iter().all(|x| x.0 == 7), "CC 8 isn't mapped: {got:?}");
-    }
-    #[cfg(unix)]
-    use deckard_model::{Group, MidiDest, Project, Sound, SoundChannel};
-    #[cfg(unix)]
-    use midir::os::unix::{VirtualInput, VirtualOutput};
-
-    /// A note from a keyboard port plays the sound that takes it, which sends it (thru,
-    /// on its channel, transposed) to the synth on its MIDI output. (Virtual ports: not
-    /// on Windows.)
-    #[cfg(unix)]
-    #[test]
-    fn keyboard_to_sound_to_synth() {
-        let synth_name = "DECKARD Test Synth";
-        let keys_name = "DECKARD Test Keys";
-        let got: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-        let g2 = got.clone();
-        let Ok(synth_in) = midir::MidiInput::new("test synth") else { return };
-        let Ok(_synth) = synth_in.create_virtual(synth_name, move |_, b, _| g2.lock().unwrap().push(b.to_vec()), ()) else { return };
-        let Ok(keys_out) = midir::MidiOutput::new("test keys") else { return };
-        let Ok(mut keys) = keys_out.create_virtual(keys_name) else { return };
-        let p = Project {
-            groups: vec![Group {
-                sounds: vec![Sound {
-                    channel: SoundChannel {
-                        midi_source: keys_name.into(),
-                        midi_thru: true,
-                        midi_out: MidiDest::Port(synth_name.into()),
-                        midi_out_channel: 4,
-                        transpose: 7,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut io = MidiIo::default();
-        let Ok(out) = deckard_engine::output::Output::new() else { return };
-        let (mut engine, _) = deckard_engine::Engine::new(&p, None, out.rate, deckard_engine::Mode::Arrangement, &mut Default::default());
-        engine.sequencing = false;
-        engine.master = 0.0;
-        out.set_midi(io.sender());
-        out.play(engine);
-        io.set_output(out.sender());
-        io.set_table(MidiTable::new(&p));
-        io.listen(&[keys_name.to_string()]);
-        assert_eq!(io.inputs.len(), 1, "listening to the keyboard");
-        keys.send(&[0x90, 60, 100]).unwrap();
-        keys.send(&[0x80, 60, 0]).unwrap();
-        for _ in 0..100 {
-            if got.lock().unwrap().len() >= 2 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(*got.lock().unwrap(), vec![vec![0x94, 67, 100], vec![0x84, 67, 0]]);
-    }
-
-    /// What a test port received, and when.
-    #[cfg(unix)]
-    type Received = Arc<Mutex<Vec<(Vec<u8>, std::time::Instant)>>>;
-
-    /// A virtual port to listen on: what arrives, and when. (Not on Windows.)
-    #[cfg(unix)]
-    fn listener(name: &str) -> Option<(midir::MidiInputConnection<()>, Received)> {
-        let got: Received = Arc::default();
-        let g2 = got.clone();
-        let input = midir::MidiInput::new("test listener").ok()?;
-        let conn = input.create_virtual(name, move |_, b, _| g2.lock().unwrap().push((b.to_vec(), std::time::Instant::now())), ()).ok()?;
-        Some((conn, got))
-    }
-
-    /// MIDI clock is sent when it's due (with the audio), notes at once.
-    #[cfg(unix)]
-    #[test]
-    fn timed_messages_wait_until_due() {
-        let name = "DECKARD Test Clock Out";
-        let Some((_conn, got)) = listener(name) else { return };
-        let io = MidiIo::default();
-        let t0 = std::time::Instant::now();
-        let port: Arc<str> = name.into();
-        let tx = io.sender();
-        tx.send(MidiOut { port: port.clone(), bytes: [0xf8, 0, 0], len: 1, at: Some(t0 + std::time::Duration::from_millis(80)) }).unwrap();
-        tx.send(MidiOut { port: port.clone(), bytes: [0x90, 60, 100], len: 3, at: None }).unwrap();
-        for _ in 0..100 {
-            if got.lock().unwrap().len() >= 2 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let got = got.lock().unwrap();
-        assert_eq!(got.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>(), [vec![0x90, 60, 100], vec![0xf8]]);
-        let late = got[1].1.duration_since(t0);
-        // Not before it's due; the upper bound only catches a wait gone wrong (loaded CI
-        // runners oversleep).
-        assert!(late >= std::time::Duration::from_millis(78) && late < std::time::Duration::from_millis(400), "{late:?}");
-    }
-
-    /// Incoming MIDI clock, on an input listened to, goes to the clock follower (and
-    /// plays nothing).
-    #[cfg(unix)]
-    #[test]
-    fn clock_in_feeds_the_follower() {
-        let name = "DECKARD Test Clock In";
-        let Ok(out) = midir::MidiOutput::new("test clock") else { return };
-        let Ok(mut clock) = out.create_virtual(name) else { return };
-        let mut io = MidiIo::default();
-        let follower = Arc::new(deckard_engine::sync::ClockFollower::default());
-        io.set_clock_follower(Some(follower.clone()));
-        io.listen(&[name.to_string()]);
-        assert_eq!(io.inputs.len(), 1);
-        clock.send(&[0xfa]).unwrap();
-        for _ in 0..4 {
-            clock.send(&[0xf8]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        for _ in 0..100 {
-            if follower.tempo().is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(follower.take_transport(), Some(deckard_engine::sync::Transport::Start(0.0)));
-        assert!(follower.tempo().is_some());
-        assert!(io.take_pending().is_empty());
-    }
 }
 
 #[cfg(test)]
+#[path = "midi_io/native.rs"]
+mod native_tests;
+#[cfg(test)]
+#[path = "midi_io/portable.rs"]
 mod portable_tests;
+
+#[cfg(test)]
+mod output_capture;

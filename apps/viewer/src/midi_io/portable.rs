@@ -51,7 +51,7 @@ fn keyboard_routes_to_offline_synth() {
 }
 
 fn receive(io: &MidiIo, bytes: &[u8], at: Instant) {
-    io.input_dispatch().receive_to("test-keys", &mut PortState::default(), bytes, at, None);
+    io.input_dispatch().receive_to(&"test-keys".into(), &mut PortState::default(), bytes, at, None);
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn input_dispatch_delivers_notes_to_the_active_engine_or_pending_queue() {
     let mut state = PortState::default();
     let mut events = Vec::new();
     for bytes in [[0x90, 60, 100], [0x80, 60, 0]] {
-        dispatch.receive_to("test-keys", &mut state, &bytes, Instant::now(), Some(&mut |event| events.push(event)));
+        dispatch.receive_to(&"test-keys".into(), &mut state, &bytes, Instant::now(), Some(&mut |event| events.push(event)));
     }
     assert!(io.take_pending().is_empty());
     assert!(matches!(events.as_slice(), [Live::NoteIn { pitch: 60, velocity: 100, .. }, Live::NoteRelease { pitch: 60, .. }]));
@@ -73,7 +73,7 @@ fn input_dispatch_delivers_notes_to_the_active_engine_or_pending_queue() {
     assert_eq!(output.iter().map(|m| m.bytes()).collect::<Vec<_>>(), [&[0x94, 67, 100][..], &[0x84, 67, 0][..]]);
     assert!(output.iter().all(|m| &*m.port == "test-synth"));
     for bytes in [[0x90, 60, 100], [0x80, 60, 0]] {
-        dispatch.receive_to("test-keys", &mut state, &bytes, Instant::now(), None);
+        dispatch.receive_to(&"test-keys".into(), &mut state, &bytes, Instant::now(), None);
     }
     assert_eq!(io.take_pending(), [(0, 0, 60, 100), (0, 0, 60, 0)]);
     assert_eq!(io.monitor().rows(crate::midi_monitor::Dir::In).len(), 4);
@@ -105,7 +105,13 @@ fn mapped_controls_are_consumed_and_unmapped_controls_reach_the_engine() {
     io.set_remote(false, [7].into());
     let mut events = Vec::new();
     for bytes in [[0xb0, 7, 10], [0xb0, 7, 64], [0xb0, 7, 127], [0xb0, 8, 1]] {
-        io.input_dispatch().receive_to("test-keys", &mut PortState::default(), &bytes, Instant::now(), Some(&mut |e| events.push(e)));
+        io.input_dispatch().receive_to(
+            &"test-keys".into(),
+            &mut PortState::default(),
+            &bytes,
+            Instant::now(),
+            Some(&mut |e| events.push(e)),
+        );
     }
     assert_eq!(io.take_remote(), [(7, 1.0)]);
     assert!(io.take_remote().is_empty());
@@ -156,15 +162,29 @@ fn malformed_input_is_ignored_and_mpe_settings_follow_preferences() {
     assert!(io.take_remote().is_empty());
     let mut state = PortState::default();
     io.set_mpe(&[("test-keys".into(), 48)].into());
-    io.input_dispatch().receive_to("test-keys", &mut state, &[0x91, 60, 100], Instant::now(), None);
+    io.input_dispatch().receive_to(&"test-keys".into(), &mut state, &[0x91, 60, 100], Instant::now(), None);
     assert_eq!(io.take_pending(), [(0, 0, 60, 100)]);
     assert_eq!(state.mpe.as_ref().unwrap().bend_range, 48.0);
     io.set_mpe(&[("test-keys".into(), 24)].into());
-    io.input_dispatch().receive_to("test-keys", &mut state, &[0x81, 60, 0], Instant::now(), None);
+    io.input_dispatch().receive_to(&"test-keys".into(), &mut state, &[0x81, 60, 0], Instant::now(), None);
     assert_eq!(io.take_pending(), [(0, 0, 60, 0)]);
     assert_eq!(state.mpe.as_ref().unwrap().bend_range, 24.0);
     io.set_mpe(&Default::default());
-    io.input_dispatch().receive_to("test-keys", &mut state, &[0x90, 62, 100], Instant::now(), None);
+    io.input_dispatch().receive_to(&"test-keys".into(), &mut state, &[0x90, 62, 100], Instant::now(), None);
     assert!(state.mpe.is_none());
     assert_eq!(io.take_pending(), [(0, 0, 62, 100)]);
+}
+
+#[test]
+fn clock_dispatch_does_not_depend_on_the_audio_sender() {
+    let io = MidiIo::default();
+    let follower = Arc::new(ClockFollower::default());
+    io.set_clock_follower(Some(follower.clone()));
+    // An unusable audio sender must not interfere with independent clock handling.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = io.output.lock().unwrap();
+        panic!("poison the audio sender for this test");
+    }));
+    io.input_dispatch().receive(&"test-keys".into(), &mut PortState::default(), &[0xfa]);
+    assert_eq!(follower.take_transport(), Some(deckard_engine::sync::Transport::Start(0.0)));
 }
