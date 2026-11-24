@@ -98,6 +98,33 @@ Run the full suite once, at the end of a branch. CI runs it on all three systems
   themselves when it isn't there.
 - **Settings:** tests use a settings folder of their own, never the user's.
 
+### MIDI tests
+
+`cargo test -p deckard midi_io::` runs the portable MIDI checks on Linux, macOS,
+and Windows. They use the real input dispatch, routing, offline engine and output
+queue decisions, with supplied timestamps and captured messages. They need no MIDI
+service, MIDI hardware, audio output device, or external sample files.
+
+Four native loopback tests are visibly ignored by default. To run them explicitly:
+
+```sh
+cargo test -p deckard native_midi_ -- --ignored --test-threads=1
+```
+
+These require an accessible ALSA sequencer on Linux (`/dev/snd/seq`) or CoreMIDI on
+macOS. They create unique virtual endpoints and discover their full OS names; no
+physical controller or audio device is required. Windows runs the portable checks;
+these virtual-port fixtures are Unix-only. CI explicitly runs the native tier on
+macOS in addition to the default three-platform suite.
+
+An explicitly requested native test fails if setup or delivery fails; it never
+reports a missing service as success. Discovery and delivery have five-second
+bounds, with the endpoint, operation and available candidates or received messages
+in timeout diagnostics. Exact timing decisions use controlled timestamps in the
+portable tests; native tests check delivery without a tight latency ceiling.
+Dropping test handles releases their endpoints; the existing output worker exits
+asynchronously after its senders are dropped.
+
 ## The workspace
 
 | Path | Crate | What it is |
@@ -186,10 +213,22 @@ to the crate's and is shown in About DECKARD.
 - **Patch coverage:** on pull requests, CI's Patch coverage check fails unless the tests
   run at least 70% of the lines the pull request adds or changes
   ([cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and
-  [diff-cover](https://github.com/Bachmann1234/diff_cover), on Linux). To check
-  before pushing: `rustup component add llvm-tools-preview`, install both, then
-  `cargo llvm-cov --workspace --cobertura --output-path coverage.xml` and
-  `diff-cover coverage.xml --compare-branch=main --fail-under=70`. Tests that skip
+  [diff-cover](https://github.com/Bachmann1234/diff_cover), on macOS). To check
+  before pushing on a machine with native MIDI available: install both tools and
+  `rustup component add llvm-tools-preview`, then run:
+
+  ```sh
+  cargo llvm-cov clean --workspace
+  cargo llvm-cov --workspace --locked --no-report
+  cargo llvm-cov -p deckard --locked --no-report -- native_midi_ --ignored --test-threads=1
+  cargo llvm-cov report --cobertura --output-path coverage.xml
+  diff-cover coverage.xml --compare-branch=origin/main --fail-under=70
+  ```
+
+  Both test runs contribute to one report. Native fixtures use `native.rs` and
+  `portable.rs` because cargo-llvm-cov omits `*_tests.rs` files by default; their
+  lines must count too. macOS CI supplies CoreMIDI; Linux can also measure this
+  locally when ALSA sequencer is available. Tests that skip
   themselves without a Maschine install still count against you on CI.
 - **Release builds:** `release.yml` builds all three when a release is published,
   versioned from the release's name (else its tag; a leading `v` is dropped), and

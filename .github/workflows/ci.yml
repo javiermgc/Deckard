@@ -40,15 +40,18 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      - name: Native MIDI loopback
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p deckard native_midi_ -- --ignored --test-threads=1
 
   # At least 70% of the lines a pull request adds or changes must run under the tests.
-  # Measured on Linux only: the rest of the code is the same on every system. Tests that
-  # need a Maschine install or projects skip themselves here, so their lines count as
-  # not covered.
+  # Combine the default suite and explicit native MIDI checks on macOS, where
+  # CoreMIDI virtual ports are available. Keep the three-platform correctness jobs.
+  # Tests needing unavailable local data still count as not covered.
   coverage:
     name: Patch coverage
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-22.04
+    runs-on: macos-latest
     permissions:
       contents: read
       # The coverage comment.
@@ -60,18 +63,18 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@v2
       - uses: Swatinem/rust-cache@v2
-      - name: Linux packages
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
       - name: Coverage tools
         run: rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.9.1
-      # A report even if a test fails: the Test job says whether they pass, and timing
-      # tests can miss under the slower instrumented build.
       - name: Measure coverage
-        run: cargo llvm-cov --workspace --locked --ignore-run-fail --cobertura --output-path coverage.xml
-      # diff-cover 11 needs Python 3.11 or later; ubuntu-22.04 has 3.10.
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --locked --no-report
+          cargo llvm-cov -p deckard --locked --no-report -- native_midi_ --ignored --test-threads=1
+          cargo llvm-cov report --cobertura --output-path coverage.xml
+      # diff-cover 11 needs Python 3.11 or later.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
