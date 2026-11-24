@@ -3,6 +3,8 @@
 //! so they keep their timing), incoming MIDI clock goes to the clock follower, and a
 //! thread sends what sounds put out (and MIDI clock, when it's due).
 
+mod schedule;
+
 use deckard_engine::Live;
 use deckard_engine::midi::{InMsg, MidiOut, MidiTable};
 use deckard_engine::output::Sender;
@@ -69,6 +71,105 @@ struct RemoteIn {
     learning: bool,
     mapped: std::collections::HashSet<u64>,
     came: Vec<(u64, f64)>,
+}
+
+/// Shared input decisions; the native callback supplies time and the active audio sender.
+#[derive(Clone)]
+struct InputDispatch {
+    table: Arc<Mutex<MidiTable>>,
+    output: Arc<Mutex<Option<Sender>>>,
+    pending: Arc<Mutex<Vec<Pending>>>,
+    count: Arc<std::sync::atomic::AtomicU64>,
+    repaint: Arc<Mutex<Option<eframe::egui::Context>>>,
+    lock: Arc<Mutex<Option<LockMidi>>>,
+    lock_pending: Arc<Mutex<Vec<usize>>>,
+    recalls: Arc<Mutex<[Option<LockMidi>; 2]>>,
+    recall_pending: Arc<Mutex<Vec<Recall>>>,
+    remote: Arc<Mutex<RemoteIn>>,
+    clock: Arc<Mutex<Option<Arc<ClockFollower>>>>,
+    mpe: Arc<Mutex<HashMap<String, u8>>>,
+    monitor: crate::midi_monitor::Monitor,
+}
+
+impl InputDispatch {
+    fn receive(&self, port: &str, st: &mut PortState, bytes: &[u8]) {
+        let at = Instant::now();
+        let out = self.output.lock().unwrap().clone().filter(Sender::has_engine);
+        let mut send = out.as_ref().map(|out| {
+            move |event| {
+                out.live(event);
+            }
+        });
+        self.receive_to(port, st, bytes, at, send.as_mut().map(|send| send as &mut dyn FnMut(Live)));
+    }
+
+    fn receive_to(&self, port: &str, st: &mut PortState, bytes: &[u8], at: Instant, live: Option<&mut dyn FnMut(Live)>) {
+        let Self { table, pending, count, repaint, lock, lock_pending, recalls, recall_pending, remote, clock, mpe, monitor, .. } = self;
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if monitor.is_open() {
+            let range = mpe.lock().unwrap().get(port).copied();
+            monitor.midi(crate::midi_monitor::Dir::In, &Arc::from(port), bytes, range);
+        }
+        if let Some(sync) = SyncMsg::parse(bytes) {
+            if let Some(f) = clock.lock().unwrap().as_ref() {
+                f.message(sync, at);
+                if sync != SyncMsg::Clock
+                    && let Some(ctx) = repaint.lock().unwrap().as_ref()
+                {
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        let Some(msg) = InMsg::parse(bytes) else { return };
+        // Lock's MIDI change first: its messages go no further.
+        let taken = lock.lock().unwrap().as_ref().and_then(|l| lock_trigger(l, port, &msg));
+        if let Some(recall) = taken {
+            if let Some(slot) = recall {
+                lock_pending.lock().unwrap().push(slot);
+                if let Some(ctx) = repaint.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        // Then the scene and section changes: the same, no further.
+        let picked = {
+            let [scene, section] = &*recalls.lock().unwrap();
+            let pick = |l: &Option<LockMidi>| l.as_ref().and_then(|l| recall_trigger(l, port, &msg, 128));
+            pick(scene).map(|n| n.map(Recall::Scene)).or_else(|| pick(section).map(|n| n.map(Recall::Section)))
+        };
+        if let Some(picked) = picked {
+            if let Some(r) = picked {
+                recall_pending.lock().unwrap().push(r);
+                if let Some(ctx) = repaint.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+        // Then remote control: a control being learned or mapped to a
+        // parameter goes no further.
+        {
+            let mut r = remote.lock().unwrap();
+            if let Some(came) = remote_take(r.learning, &r.mapped, bytes) {
+                r.came.push(came);
+                if let Some(ctx) = repaint.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
+                }
+                return;
+            }
+        }
+        // An MPE input or not, as Preferences says now.
+        let range = mpe.lock().unwrap().get(port).copied();
+        match (range, st.mpe.as_mut()) {
+            (Some(r), Some(z)) => z.bend_range = r as f32,
+            (Some(r), None) => st.mpe = Some(Mpe::new(r)),
+            (None, Some(_)) => st.mpe = None,
+            (None, None) => {}
+        }
+        handle(table, live, pending, repaint, port, st, msg);
+    }
 }
 
 pub struct MidiIo {
@@ -162,21 +263,22 @@ fn send_loop(
         }
     };
     // Messages waiting for their time, in the order they came (which is theirs).
-    let mut waiting: std::collections::VecDeque<MidiOut> = std::collections::VecDeque::new();
+    let mut waiting = schedule::PendingOutput::default();
     loop {
         let now = Instant::now();
-        while waiting.front().is_some_and(|m| m.at.is_none_or(|t| t <= now)) {
-            if let Some(m) = waiting.pop_front() {
-                send(&m);
-            }
+        while let Some(m) = waiting.take_due(now) {
+            send(&m);
         }
-        let next = match waiting.front().and_then(|m| m.at) {
+        let next = match waiting.next_deadline() {
             Some(due) => rx.recv_timeout(due.saturating_duration_since(now)),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match next {
-            Ok(m) if m.at.is_some_and(|t| t > Instant::now()) => waiting.push_back(m),
-            Ok(m) => send(&m),
+            Ok(m) => {
+                if let Some(m) = waiting.accept(m, Instant::now()) {
+                    send(&m);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -195,6 +297,24 @@ fn connect_out(name: &str) -> Option<midir::MidiOutputConnection> {
 }
 
 impl MidiIo {
+    fn input_dispatch(&self) -> InputDispatch {
+        InputDispatch {
+            table: self.table.clone(),
+            output: self.output.clone(),
+            pending: self.pending.clone(),
+            count: self.count.clone(),
+            repaint: self.repaint.clone(),
+            lock: self.lock.clone(),
+            lock_pending: self.lock_pending.clone(),
+            recalls: self.recalls.clone(),
+            recall_pending: self.recall_pending.clone(),
+            remote: self.remote.clone(),
+            clock: self.clock.clone(),
+            mpe: self.mpe.clone(),
+            monitor: self.monitor.clone(),
+        }
+    }
+
     /// The MIDI Monitor's log (shared with the MK3's pads).
     pub fn monitor(&self) -> crate::midi_monitor::Monitor {
         self.monitor.clone()
@@ -264,83 +384,14 @@ impl MidiIo {
             // MIDI clock and the song position come through too.
             input.ignore(midir::Ignore::None);
             let Some(port) = input.ports().into_iter().find(|p| input.port_name(p).is_ok_and(|n| &n == name)) else { continue };
-            let (table, output, pending, count, repaint) =
-                (self.table.clone(), self.output.clone(), self.pending.clone(), self.count.clone(), self.repaint.clone());
-            let (lock, lock_pending, clock, remote) =
-                (self.lock.clone(), self.lock_pending.clone(), self.clock.clone(), self.remote.clone());
-            let (recalls, recall_pending) = (self.recalls.clone(), self.recall_pending.clone());
-            let (mpe, monitor) = (self.mpe.clone(), self.monitor.clone());
+            let dispatch = self.input_dispatch();
             let mut st = PortState::default();
             let port_name: Arc<str> = name.as_str().into();
             let conn = input.connect(
                 &port,
                 "DECKARD in",
                 move |_, bytes, _| {
-                    let at = Instant::now();
-                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if monitor.is_open() {
-                        let range = mpe.lock().unwrap().get(&*port_name).copied();
-                        monitor.midi(crate::midi_monitor::Dir::In, &port_name, bytes, range);
-                    }
-                    if let Some(sync) = SyncMsg::parse(bytes) {
-                        if let Some(f) = clock.lock().unwrap().as_ref() {
-                            f.message(sync, at);
-                            if sync != SyncMsg::Clock
-                                && let Some(ctx) = repaint.lock().unwrap().as_ref()
-                            {
-                                ctx.request_repaint();
-                            }
-                        }
-                        return;
-                    }
-                    let Some(msg) = InMsg::parse(bytes) else { return };
-                    // Lock's MIDI change first: its messages go no further.
-                    let taken = lock.lock().unwrap().as_ref().and_then(|l| lock_trigger(l, &port_name, &msg));
-                    if let Some(recall) = taken {
-                        if let Some(slot) = recall {
-                            lock_pending.lock().unwrap().push(slot);
-                            if let Some(ctx) = repaint.lock().unwrap().as_ref() {
-                                ctx.request_repaint();
-                            }
-                        }
-                        return;
-                    }
-                    // Then the scene and section changes: the same, no further.
-                    let picked = {
-                        let [scene, section] = &*recalls.lock().unwrap();
-                        let pick = |l: &Option<LockMidi>| l.as_ref().and_then(|l| recall_trigger(l, &port_name, &msg, 128));
-                        pick(scene).map(|n| n.map(Recall::Scene)).or_else(|| pick(section).map(|n| n.map(Recall::Section)))
-                    };
-                    if let Some(picked) = picked {
-                        if let Some(r) = picked {
-                            recall_pending.lock().unwrap().push(r);
-                            if let Some(ctx) = repaint.lock().unwrap().as_ref() {
-                                ctx.request_repaint();
-                            }
-                        }
-                        return;
-                    }
-                    // Then remote control: a control being learned or mapped to a
-                    // parameter goes no further.
-                    {
-                        let mut r = remote.lock().unwrap();
-                        if let Some(came) = remote_take(r.learning, &r.mapped, bytes) {
-                            r.came.push(came);
-                            if let Some(ctx) = repaint.lock().unwrap().as_ref() {
-                                ctx.request_repaint();
-                            }
-                            return;
-                        }
-                    }
-                    // An MPE input or not, as Preferences says now.
-                    let range = mpe.lock().unwrap().get(&*port_name).copied();
-                    match (range, st.mpe.as_mut()) {
-                        (Some(r), Some(z)) => z.bend_range = r as f32,
-                        (Some(r), None) => st.mpe = Some(Mpe::new(r)),
-                        (None, Some(_)) => st.mpe = None,
-                        (None, None) => {}
-                    }
-                    handle(&table, &output, &pending, &repaint, &port_name, &mut st, msg);
+                    dispatch.receive(&port_name, &mut st, bytes);
                 },
                 (),
             );
@@ -554,7 +605,7 @@ pub(crate) fn route(t: &MidiTable, st: &mut PortState, port: &str, msg: InMsg) -
 /// Play an incoming message on the channels it reaches.
 fn handle(
     table: &Mutex<MidiTable>,
-    output: &Mutex<Option<Sender>>,
+    mut live: Option<&mut dyn FnMut(Live)>,
     pending: &Mutex<Vec<Pending>>,
     repaint: &Mutex<Option<eframe::egui::Context>>,
     port: &str,
@@ -562,12 +613,11 @@ fn handle(
     msg: InMsg,
 ) {
     let t = table.lock().unwrap();
-    let out = output.lock().unwrap().clone().filter(Sender::has_engine);
     let mut later = Vec::new();
     for l in route(&t, st, port, msg) {
-        match (&out, l) {
+        match (live.as_deref_mut(), l) {
             (Some(o), l) => {
-                o.live(l);
+                o(l);
             }
             // No engine yet: the notes, for the app to play.
             (None, Live::NoteIn { group, sound, pitch, velocity, .. }) => later.push((group, sound, pitch, velocity)),
