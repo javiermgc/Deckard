@@ -2279,6 +2279,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "deckard-ni-content"
+version = "0.1.0"
+dependencies = [
+ "mxprj",
+ "plist",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "deckard-nwl"
 version = "0.1.0"
 dependencies = [
