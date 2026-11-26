@@ -548,6 +548,14 @@ pub struct Picture {
 }
 
 impl Picture {
+    /// Text in recorded drawing commands, without rasterizing the display.
+    pub fn text_labels(&self) -> impl Iterator<Item = &str> {
+        self.ops.iter().filter_map(|op| match op {
+            DrawOp::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn new(background: [u8; 3]) -> Picture {
         Picture {
             background,

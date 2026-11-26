@@ -54,7 +54,9 @@ pub fn prefixes(request: &DiscoveryRequest) -> Vec<PathBuf> {
 }
 pub fn discover(request: &DiscoveryRequest) -> DiscoveryReport {
     let mut report = DiscoveryReport::default();
-    for prefix in prefixes(request) {
+    let prefixes = prefixes(request);
+    report.sources = Some(prefixes.iter().map(|p| format!("wine:{}", canonical(p).display())).collect());
+    for prefix in prefixes {
         report.extend(read_prefix(&prefix));
     }
     report

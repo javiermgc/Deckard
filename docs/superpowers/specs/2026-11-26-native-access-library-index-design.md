@@ -1,6 +1,6 @@
 # Native Access library discovery and indexing
 
-Status: proposed design accompanying the requested implementation plan; no implementation authorized by this document.
+Status: implementation authorized by the user on 2026-11-26 and completed on `javiermgc/native-access-library-index`. See [verification](../../native-access-libraries-verification.md) for measured coverage and platform limitations. No PR authorized.
 
 ## Intent and agreed scope
 

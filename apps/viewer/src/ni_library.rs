@@ -29,6 +29,7 @@ impl NiLibrary {
             std::thread::Builder::new()
                 .name("ni-catalog".into())
                 .spawn(move || {
+                    let mut previous: DiscoveryReport = Default::default();
                     while let Ok(mut job) = rx.recv() {
                         while let Ok(next) = rx.try_recv() {
                             job = next;
@@ -42,10 +43,20 @@ impl NiLibrary {
                                     home: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
                                     ..Default::default()
                                 });
+                                r.sources = None;
                                 r.issue("configuration", error);
                                 r
                             }
                         };
+                        for old in &previous.installations {
+                            if !report.complete_sources.contains(&old.source)
+                                && report.sources.as_ref().is_none_or(|sources| sources.contains(&old.source))
+                                && !report.installations.iter().any(|i| i.id == old.id)
+                            {
+                                report.installations.push(old.clone());
+                            }
+                        }
+                        previous = report.clone();
                         // Normalize provider ordering before publishing a revision.
                         report.complete_sources.sort();
                         report.complete_sources.dedup();

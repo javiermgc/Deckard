@@ -64,54 +64,57 @@ pub(super) fn parse(b: &[u8], result: &mut MetadataRead) -> Result<(), String> {
     }
     let mut primary = ContentMetadata::default();
     let mut fallback = ContentMetadata::default();
-    while at < body.len() {
-        let Some(h) = body.get(at..at + 10) else {
-            if body[at..].iter().all(|c| *c == 0) {
+    let parsed = (|| {
+        while at < body.len() {
+            let Some(h) = body.get(at..at + 10) else {
+                if body[at..].iter().all(|c| *c == 0) {
+                    break;
+                }
+                return Err("truncated ID3 frame header".into());
+            };
+            if h[..4] == [0, 0, 0, 0] {
                 break;
             }
-            return Err("truncated ID3 frame header".into());
-        };
-        if h[..4] == [0, 0, 0, 0] {
-            break;
-        }
-        let size = if version == 4 { sync(&h[4..8])? } else { u32::from_be_bytes(h[4..8].try_into().unwrap()) as usize };
-        at += 10;
-        let frame = body.get(at..at + size).ok_or("truncated ID3 frame")?;
-        at += size;
-        if &h[..4] != b"GEOB" {
-            continue;
-        }
-        let parsed = (|| {
-            let flags = h[9];
-            if (version == 3 && flags & 0xe0 != 0) || (version == 4 && flags & 0x4d != 0) {
-                return Err("unsupported compressed/encrypted/grouped ID3 metadata".into());
+            let size = if version == 4 { sync(&h[4..8])? } else { u32::from_be_bytes(h[4..8].try_into().unwrap()) as usize };
+            at += 10;
+            let frame = body.get(at..at + size).ok_or("truncated ID3 frame")?;
+            at += size;
+            if &h[..4] != b"GEOB" {
+                continue;
             }
-            let unsynced;
-            let frame = if version == 4 && (flags & 2 != 0 || b[5] & 128 != 0) {
-                unsynced = deunsync(frame);
-                &unsynced[..]
-            } else {
-                frame
-            };
-            let (&enc, rest) = frame.split_first().ok_or("empty GEOB")?;
-            if enc > 3 {
-                return Err("invalid GEOB encoding".into());
+            let parsed = (|| {
+                let flags = h[9];
+                if (version == 3 && flags & 0xe0 != 0) || (version == 4 && flags & 0x4d != 0) {
+                    return Err("unsupported compressed/encrypted/grouped ID3 metadata".into());
+                }
+                let unsynced;
+                let frame = if version == 4 && (flags & 2 != 0 || b[5] & 128 != 0) {
+                    unsynced = deunsync(frame);
+                    &unsynced[..]
+                } else {
+                    frame
+                };
+                let (&enc, rest) = frame.split_first().ok_or("empty GEOB")?;
+                if enc > 3 {
+                    return Err("invalid GEOB encoding".into());
+                }
+                let (_, rest) = terminated(rest, false)?;
+                let (_, rest) = terminated(rest, enc == 1 || enc == 2)?;
+                let (desc, data) = terminated(rest, enc == 1 || enc == 2)?;
+                match text(desc, enc).as_str() {
+                    "com.native-instruments.nks.soundinfo" => primary.fill(from_nks(data)?),
+                    "com.native-instruments.nisound.soundinfo" => fallback.fill(from_nisound(data)?),
+                    _ => {}
+                }
+                Ok::<_, String>(())
+            })();
+            if let Err(e) = parsed {
+                result.warnings.push(e);
             }
-            let (_, rest) = terminated(rest, false)?;
-            let (_, rest) = terminated(rest, enc == 1 || enc == 2)?;
-            let (desc, data) = terminated(rest, enc == 1 || enc == 2)?;
-            match text(desc, enc).as_str() {
-                "com.native-instruments.nks.soundinfo" => primary.fill(from_nks(data)?),
-                "com.native-instruments.nisound.soundinfo" => fallback.fill(from_nisound(data)?),
-                _ => {}
-            }
-            Ok::<_, String>(())
-        })();
-        if let Err(e) = parsed {
-            result.warnings.push(e);
         }
-    }
+        Ok::<_, String>(())
+    })();
     primary.fill(fallback);
     result.metadata.fill(primary);
-    Ok(())
+    parsed
 }

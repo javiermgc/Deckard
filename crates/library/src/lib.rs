@@ -194,6 +194,7 @@ pub struct Library {
     ni: Option<ni::NiIndex>,
     own: user::UserIndex,
     scan: Option<native_scan::Scanner>,
+    canonical_paths: std::collections::HashMap<PathBuf, PathBuf>,
     /// Why NI's index isn't there, if it should be.
     pub ni_error: Option<String>,
 }
@@ -208,7 +209,7 @@ impl Library {
         };
         let own = user::UserIndex::open(own)?;
         native_index::initialize(&own.db)?;
-        Ok(Library { ni, own, ni_error, scan: None })
+        Ok(Library { ni, own, ni_error, scan: None, canonical_paths: Default::default() })
     }
 
     /// Both sources' results, one entry per file (DECKARD's when both list it), the
@@ -235,7 +236,15 @@ impl Library {
         // snapshots, so key DECKARD's overrides by `<path>#<uuid>` and preserve NI's per-row
         // favorite status instead of merging by file path alone.
         let (favorites, not_favorites) = (self.own.favorite_keys(), self.own.not_favorite_keys());
-        let native = native_index::items(&self.own).unwrap_or_default();
+        let native = native_index::items(&self.own, q).unwrap_or_default();
+        let native_products = native_index::products(&self.own, q).unwrap_or_default();
+        let paths = &mut self.canonical_paths;
+        let mut merge_key = |item: &Item| {
+            (
+                paths.entry(item.path.clone()).or_insert_with(|| item.path.canonicalize().unwrap_or_else(|_| item.path.clone())).clone(),
+                if Item::is_ensemble_container(&item.path) { item.uuid.clone().filter(|u| !u.is_empty()) } else { None },
+            )
+        };
         let saved: std::collections::HashSet<_> = self
             .own
             .query(&Query { kind: q.kind, user: true, ..Default::default() })
@@ -244,12 +253,21 @@ impl Library {
             .into_iter()
             .map(|i| merge_key(&i))
             .collect();
-        let owned = native_index::owned_roots(&self.own.db);
+        let owned: Vec<_> = native_index::owned_roots(&self.own.db).into_iter().map(|p| p.canonicalize().unwrap_or(p)).collect();
+        let unavailable: Vec<_> =
+            native_index::unavailable_roots(&self.own.db).into_iter().map(|p| p.canonicalize().unwrap_or(p)).collect();
         let mut merged = std::collections::BTreeMap::new();
         for item in theirs.items {
-            merged.insert(merge_key(&item), item);
+            let key = merge_key(&item);
+            if !item.user && unavailable.iter().any(|root| key.0.starts_with(root)) {
+                continue;
+            }
+            merged.insert(key, item);
         }
-        for mut item in native.into_iter().filter(|i| i.kind == q.kind && !saved.contains(&merge_key(i))) {
+        for mut item in native {
+            if item.kind != q.kind || saved.contains(&merge_key(&item)) {
+                continue;
+            }
             if let Some(old) = merged.get(&merge_key(&item)) {
                 if item.types.is_empty() {
                     item.types = old.types.clone();
@@ -271,18 +289,22 @@ impl Library {
                 }
                 item.favorite = old.favorite;
                 item.preview_subpath = old.preview_subpath.clone();
+                if item.uuid.is_none() {
+                    item.uuid = old.uuid.clone();
+                }
             }
             merged.insert(merge_key(&item), item);
         }
         for item in own.items {
-            if item.user || !owned.iter().any(|r| item.path.starts_with(r)) {
+            if item.user || !owned.iter().any(|r| merge_key(&item).0.starts_with(r)) {
                 merged.insert(merge_key(&item), item);
             }
         }
         let mut items: Vec<_> = merged.into_values().filter(|i| i.user == q.user && (q.user || !saved.contains(&merge_key(i)))).collect();
         for i in &mut items {
             let key = i.favorite_key();
-            let legacy_key = i.uuid.as_deref().filter(|u| !u.is_empty()).is_some_and(|_| Item::is_ensemble_container(&i.path));
+            let legacy_key =
+                i.native_key.is_some() || i.uuid.as_deref().filter(|u| !u.is_empty()).is_some_and(|_| Item::is_ensemble_container(&i.path));
             let suppressed = not_favorites.contains(&key) || (!legacy_key && not_favorites.contains(&*i.path.to_string_lossy()));
             let added = favorites.contains(&key) || (!legacy_key && favorites.contains(&*i.path.to_string_lossy()));
             i.favorite = !suppressed && (added || i.favorite);
@@ -294,6 +316,9 @@ impl Library {
             })
             .filter(|i| open.vendor.as_ref().is_none_or(|v| v.eq_ignore_ascii_case(&i.vendor)))
             .filter_map(|i| i.product.clone())
+            .chain(
+                native_products.into_iter().filter(|p| q.products.is_empty() || q.products.iter().any(|want| want.eq_ignore_ascii_case(p))),
+            )
             .collect();
         items.retain(|i| (q.product.is_none() || q.product == i.product) && q.admits(i));
         Results::of(items, q, products.into_iter().collect())
@@ -313,6 +338,7 @@ impl Library {
 
     /// Drop what DECKARD's index has under `dir`.
     pub fn forget(&mut self, dir: &std::path::Path) {
+        let _ = self.cancel_scan();
         let _ = self.own.forget(dir);
     }
 
@@ -345,9 +371,26 @@ impl Library {
     }
 }
 
-fn merge_key(item: &Item) -> (PathBuf, Option<String>) {
-    (
-        item.path.canonicalize().unwrap_or_else(|_| item.path.clone()),
-        if Item::is_ensemble_container(&item.path) { item.uuid.clone().filter(|u| !u.is_empty()) } else { None },
-    )
+#[cfg(test)]
+mod native_query_tests {
+    use super::*;
+    #[test]
+    fn native_query_only_deserializes_the_selected_product_and_skips_user_tab() {
+        let t = tempfile::tempdir().unwrap();
+        let mut lib = Library::new(None, &t.path().join("db")).unwrap();
+        let mut report = deckard_ni_content::DiscoveryReport::default();
+        for name in ["A", "B"] {
+            let root = t.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("Hit.wav"), b"RIFF\x04\0\0\0WAVE").unwrap();
+            report.installations.push(deckard_ni_content::Installation::registered("fixture", name, Some(root), None));
+        }
+        lib.begin_scan(ScanRequest { generation: 1, discovery: report, manual: vec![] }).unwrap();
+        while !lib.scan_step(64).unwrap().finished {}
+        lib.canonical_paths.clear();
+        assert!(lib.query(&Query { user: true, ..Default::default() }).items.is_empty());
+        assert!(lib.canonical_paths.is_empty());
+        assert_eq!(lib.query(&Query { product: Some("A".into()), ..Default::default() }).items.len(), 1);
+        assert_eq!(lib.canonical_paths.len(), 1, "only the selected product's paths should be resolved");
+    }
 }

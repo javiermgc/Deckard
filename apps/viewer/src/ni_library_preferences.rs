@@ -13,17 +13,23 @@ impl crate::App {
         }
         if let Some(snapshot) = &self.ni_library.snapshot {
             eframe::egui::ScrollArea::vertical().id_salt("ni-libraries").max_height(160.0).show(ui, |ui| {
-                for i in deckard_ni_content::select_installations(&snapshot.report) {
-                    ui.label(format!(
-                        "{} — {}",
-                        i.name,
-                        match i.availability {
-                            deckard_ni_content::Availability::Available => "Available",
+                let selected = deckard_ni_content::select_installations(&snapshot.report);
+                for i in &snapshot.report.installations {
+                    let chosen = selected.iter().any(|s| s.id == i.id);
+                    let status = if !chosen {
+                        "Alternate installation"
+                    } else {
+                        self.browser.product_status.get(&i.id).map(String::as_str).unwrap_or(match i.availability {
+                            deckard_ni_content::Availability::Available => "Discovered — awaiting index",
                             deckard_ni_content::Availability::Missing => "Missing",
                             deckard_ni_content::Availability::Unreadable => "Unreadable",
-                        }
-                    ))
-                    .on_hover_text(i.root.map(|p| p.display().to_string()).unwrap_or(i.source));
+                        })
+                    };
+                    ui.label(format!("{} — {status}", i.name)).on_hover_text(format!(
+                        "{}\n{}",
+                        i.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                        i.source
+                    ));
                 }
                 for issue in &snapshot.report.issues {
                     ui.label(format!("{}: {}", issue.source, issue.message));

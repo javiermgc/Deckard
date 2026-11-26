@@ -20,6 +20,7 @@ pub struct ScanProgress {
     pub processed: usize,
     pub finished: bool,
     pub issues: Vec<String>,
+    pub product_status: std::collections::BTreeMap<String, String>,
 }
 enum Root {
     Native(Installation),
@@ -39,12 +40,14 @@ struct Walk {
     visited: HashSet<PathBuf>,
     seen: HashSet<String>,
     failed: bool,
+    started_count: usize,
 }
 pub(crate) struct Scanner {
     roots: VecDeque<Root>,
     walk: Option<Walk>,
     progress: ScanProgress,
     owned: Vec<PathBuf>,
+    known: std::collections::HashMap<String, i64>,
 }
 impl Library {
     pub fn begin_scan(&mut self, request: ScanRequest) -> Result<(), String> {
@@ -53,11 +56,14 @@ impl Library {
         let mut roots: VecDeque<_> =
             installations.into_iter().filter(|i| i.availability == Availability::Available && i.root.is_some()).map(Root::Native).collect();
         roots.extend(request.manual.into_iter().map(Root::Manual));
-        let owned = index::owned_roots(&self.own.db);
+        self.canonical_paths.clear();
+        let owned = index::owned_roots(&self.own.db).into_iter().map(|p| p.canonicalize().unwrap_or(p)).collect();
+        let known = self.own.known_mtimes()?;
         self.scan = Some(Scanner {
             roots,
             walk: None,
             owned,
+            known,
             progress: ScanProgress {
                 generation: request.generation,
                 issues: request.discovery.issues.iter().map(|e| format!("{}: {}", e.source, e.message)).collect(),
@@ -103,11 +109,27 @@ impl Scanner {
                 match std::fs::read_dir(root.path()) {
                     Ok(rd) => {
                         let canonical = root.path().canonicalize().unwrap_or_else(|_| root.path().to_path_buf());
-                        self.walk =
-                            Some(Walk { root, stack: vec![rd], visited: HashSet::from([canonical]), seen: HashSet::new(), failed: false });
+                        if let Root::Native(i) = &root {
+                            self.progress.product_status.insert(i.id.clone(), "Indexing…".into());
+                        }
+                        self.walk = Some(Walk {
+                            root,
+                            stack: vec![rd],
+                            visited: HashSet::from([canonical]),
+                            seen: HashSet::new(),
+                            failed: false,
+                            started_count: self.progress.processed,
+                        });
                     }
                     Err(e) => {
                         self.progress.issues.push(format!("{}: {e}", root.path().display()));
+                        if let Root::Native(i) = &root {
+                            lib.own
+                                .db
+                                .execute("UPDATE native_installations SET available=0 WHERE id=?1", [&i.id])
+                                .map_err(|e| e.to_string())?;
+                            self.progress.product_status.insert(i.id.clone(), "Unreadable — cached index retained".into());
+                        }
                         continue;
                     }
                 }
@@ -115,6 +137,28 @@ impl Scanner {
             let walk = self.walk.as_mut().unwrap();
             let Some(rd) = walk.stack.last_mut() else {
                 let walk = self.walk.take().unwrap();
+                if let Root::Native(i) = &walk.root {
+                    let status = if walk.failed {
+                        "Scan failed — cached index retained".into()
+                    } else {
+                        let n = self.progress.processed - walk.started_count;
+                        if n == 0 { "No supported content".into() } else { format!("Indexed ({n} files)") }
+                    };
+                    self.progress.product_status.insert(i.id.clone(), status.clone());
+                    lib.own
+                        .db
+                        .execute(
+                            "INSERT OR REPLACE INTO native_scan_status VALUES(?1,?2,?3)",
+                            rusqlite::params![i.product_id, status, (self.progress.processed - walk.started_count) as i64],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if walk.failed {
+                        lib.own
+                            .db
+                            .execute("UPDATE native_installations SET available=0 WHERE id=?1", [&i.id])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
                 if !walk.failed {
                     match walk.root {
                         Root::Native(i) => index::publish(&lib.own.db, &i.product_id)?,
@@ -124,7 +168,14 @@ impl Scanner {
                                 .query_map([], |r| r.get::<_, String>(0))
                                 .map_err(|e| e.to_string())?
                                 .flatten()
-                                .filter(|p| Path::new(p).starts_with(&root.path) && !walk.seen.contains(p))
+                                .filter(|p| {
+                                    Path::new(p).starts_with(&root.path)
+                                        && !walk.seen.contains(p)
+                                        && !self
+                                            .owned
+                                            .iter()
+                                            .any(|r| Path::new(p).canonicalize().unwrap_or_else(|_| PathBuf::from(p)).starts_with(r))
+                                })
                                 .collect();
                             drop(st);
                             for path in gone {
@@ -151,7 +202,11 @@ impl Scanner {
                 continue;
             }
             let path = entry.path();
-            if matches!(walk.root, Root::Manual(_)) && self.owned.iter().any(|r| path.starts_with(r)) {
+            if entry.file_type().is_ok_and(|t| t.is_file()) && kind(&path).is_none() {
+                continue;
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if matches!(walk.root, Root::Manual(_)) && self.owned.iter().any(|r| canonical.starts_with(r)) {
                 continue;
             }
             let meta = match std::fs::metadata(&path) {
@@ -188,9 +243,14 @@ impl Scanner {
             match &walk.root {
                 Root::Manual(root) => {
                     if Kind::of_file(&path).is_some()
-                        || path.extension().and_then(|s| s.to_str()).is_some_and(|s| ["nksf", "nksfx"].contains(&s))
+                        || path
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| ["nksf", "nksfx"].iter().any(|e| s.eq_ignore_ascii_case(e)))
                     {
-                        lib.own.add_file(&path, root)?;
+                        if self.known.get(&path.to_string_lossy().into_owned()) != Some(&user::mtime(&path)) {
+                            lib.own.add_file(&path, root)?;
+                        }
                         walk.seen.insert(path.to_string_lossy().into_owned());
                         self.progress.processed += 1;
                     }

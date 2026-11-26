@@ -152,3 +152,49 @@ fn unnamed_maschine_description_does_not_corrupt_child_traversal() {
     std::fs::write(&p, mxprj::container::new_file(*b"PROJ", b"archive", "test", &info, &mut || [0; 16])).unwrap();
     assert!(read_content(&p).unwrap().warnings.is_empty());
 }
+#[test]
+fn malicious_maschine_frame_size_is_a_warning_not_a_panic() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("bad.mxgrp");
+    let mut b = mxprj::container::new_file(*b"GRP ", b"archive", "test", &Default::default(), &mut || [0; 16]);
+    b[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&p, b).unwrap();
+    assert!(!read_content(&p).unwrap().warnings.is_empty());
+}
+#[test]
+fn valid_metadata_survives_a_later_truncated_id3_frame() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("sample.mp3");
+    let mut tag = id3(4);
+    tag.extend(b"GEOB\x00\x00\x00\x7f\x00\x00broken");
+    let n = tag.len() - 10;
+    tag[6..10].copy_from_slice(&sync(n));
+    std::fs::write(&p, tag).unwrap();
+    let r = read_content(&p).unwrap();
+    assert!(!r.warnings.is_empty());
+    assert_eq!(r.metadata.name.as_deref(), Some("Shuffle Woo 1"));
+}
+#[test]
+fn nisound_fills_only_missing_nks_fields() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("sample.wav");
+    let mut info = mxprj::sound_info::SoundInfo::default();
+    info.name = "Fallback name".into();
+    info.author = "Fallback author".into();
+    info.set_tags(&[vec!["Wrong".into()]], &["Acoustic".into()]);
+    let mut geob = b"\0\0\0com.native-instruments.nisound.soundinfo\0".to_vec();
+    geob.extend(info.to_bytes());
+    let mut tag = id3(4);
+    tag.extend(b"GEOB");
+    tag.extend(sync(geob.len()));
+    tag.extend([0, 0]);
+    tag.extend(geob);
+    let n = tag.len() - 10;
+    tag[6..10].copy_from_slice(&sync(n));
+    std::fs::write(&p, riff(vec![(b"ID3 ", tag)], b"WAVE")).unwrap();
+    let m = read_content(&p).unwrap().metadata;
+    assert_eq!(m.name.as_deref(), Some("Shuffle Woo 1"));
+    assert_eq!(m.author.as_deref(), Some("Fallback author"));
+    assert_eq!(m.types, vec![vec!["Percussion", "Other"]]);
+    assert_eq!(m.characters, vec!["Acoustic"]);
+}

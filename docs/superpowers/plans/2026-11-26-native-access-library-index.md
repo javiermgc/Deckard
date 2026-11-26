@@ -10,6 +10,10 @@
 
 **Spec:** [Native Access library discovery and indexing](../specs/2026-11-26-native-access-library-index-design.md). Read both documents before execution. Implementation authorized by the user on 2026-11-26 on its own branch. No permission to open a PR.
 
+## Execution outcome
+
+Implemented on `javiermgc/native-access-library-index` from `origin/main` (`2793af2`). The checklist below records the original proposed steps; the [verification record](../../native-access-libraries-verification.md) records actual coverage, review fixes, decisions, and remaining native-platform validation.
+
 ## Global Constraints
 
 - Support native Windows, native macOS, and Linux with Wine; Maschine is never required.

@@ -54,6 +54,7 @@ pub struct Browser {
     pub files: Vec<Entry>,
     pub file_selected: Option<PathBuf>,
     pub scan_status: String,
+    pub product_status: std::collections::BTreeMap<String, String>,
     pub scanning: bool,
     scan_progress: Option<mpsc::Receiver<deckard_library::ScanProgress>>,
     scan_generation: u64,
@@ -85,6 +86,7 @@ impl Default for Browser {
             file_selected: None,
             worker: None,
             scan_status: String::new(),
+            product_status: Default::default(),
             scanning: false,
             scan_progress: None,
             scan_generation: 0,
@@ -208,7 +210,14 @@ impl Browser {
                                         }
                                     }
                                 }
-                                other => run(&mut lib, other),
+                                other => {
+                                    run(&mut lib, other);
+                                    if let Some((n, q)) = last.clone()
+                                        && !reply(&mut lib, n, q)
+                                    {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -314,6 +323,7 @@ impl Browser {
                     continue;
                 }
                 self.scanning = !progress.finished;
+                self.product_status.extend(progress.product_status);
                 self.scan_status = if progress.finished {
                     if progress.issues.is_empty() {
                         format!("Library refreshed ({} files)", progress.processed)
@@ -439,9 +449,7 @@ impl Browser {
     }
 }
 
-/// Keep the newest query, and hold every other job until that query has been
-/// answered. A scan queued in the same breath must not run first: it walks the
-/// user's folders, and the expansions are already in the index.
+/// Coalesce queries, apply queued edits before answering, and defer folder walks.
 fn split_query(mut job: Job, rx: &mpsc::Receiver<Job>) -> (Job, Vec<Job>) {
     let mut later = Vec::new();
     while matches!(job, Job::Query(..)) {
@@ -450,6 +458,17 @@ fn split_query(mut job: Job, rx: &mpsc::Receiver<Job>) -> (Job, Vec<Job>) {
             Ok(other) => later.push(other),
             Err(_) => break,
         }
+    }
+    if matches!(job, Job::Query(..)) {
+        let (mut edits, scans): (Vec<_>, Vec<_>) =
+            later.into_iter().partition(|j| matches!(j, Job::Favorite(..) | Job::Saved(..) | Job::Forget(..)));
+        if !edits.is_empty() {
+            let first = edits.remove(0);
+            edits.push(job);
+            edits.extend(scans);
+            return (first, edits);
+        }
+        return (job, scans);
     }
     (job, later)
 }
@@ -867,5 +886,20 @@ mod current_query_tests {
         };
         assert_eq!(prehear_file_with_nbpl(&kontour, None), None);
         assert_eq!(prehear_file_with_nbpl(&kontour, Some(&nbpl_samples)), Some(kontour_ogg));
+    }
+}
+
+#[cfg(test)]
+mod mutation_order_tests {
+    use super::*;
+    #[test]
+    fn queued_mutations_precede_the_latest_query_but_scans_follow_it() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Job::Favorite("saved".into(), true)).unwrap();
+        tx.send(Job::Scan(vec![])).unwrap();
+        tx.send(Job::Query(2, Query::default())).unwrap();
+        let (first, later) = split_query(Job::Query(1, Query::default()), &rx);
+        assert!(matches!(first, Job::Favorite(_, true)), "a final query cannot be answered before the favorite it refreshes");
+        assert!(matches!(later.as_slice(), [Job::Query(2, _), Job::Scan(_)]));
     }
 }

@@ -61,15 +61,15 @@ fn wine_custom_mapping_precedence_and_case_resolution() {
         home: t.path().join("home"),
         ..Default::default()
     };
-    let r = discover(&request);
+    let r = wine::discover(&request);
     assert_eq!(r.installations.len(), 1, "{r:?}");
-    assert_eq!(r.installations[0].root, Some(content.join("Rhéthm Library")));
-    assert_eq!(wine_to_host(&p, "z:\\rhéthm library").unwrap(), content.join("Rhéthm Library"));
+    assert_eq!(r.installations[0].root, Some(content.canonicalize().unwrap().join("Rhéthm Library")));
+    assert_eq!(wine_to_host(&p, "z:\\rhéthm library").unwrap(), content.canonicalize().unwrap().join("Rhéthm Library"));
     assert!(wine_to_host(&p, "Q:\\unknown").is_err());
     assert!(wine_to_host(&p, "relative").is_err());
     std::fs::create_dir(content.join("RHÉTHM LIBRARY")).unwrap();
     assert!(wine_to_host(&p, "z:\\rhéthm library").is_err());
-    assert_eq!(wine_to_host(&p, "z:\\Rhéthm Library").unwrap(), content.join("Rhéthm Library"));
+    assert_eq!(wine_to_host(&p, "z:\\Rhéthm Library").unwrap(), content.canonicalize().unwrap().join("Rhéthm Library"));
 }
 #[test]
 fn missing_prefix_is_failed_not_complete() {
@@ -100,7 +100,7 @@ fn wine_prefix_precedence_yabridge_and_symlink_dedup() {
         yabridge_plugin_dirs: vec![b.join("drive_c/Program Files/VST3")],
         home: t.path().into(),
     };
-    assert_eq!(wine::prefixes(&r), vec![a, b]);
+    assert_eq!(wine::prefixes(&r), vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]);
 }
 #[test]
 fn same_product_copies_select_first_available() {

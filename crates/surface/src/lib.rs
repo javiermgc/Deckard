@@ -1302,6 +1302,7 @@ pub struct Surface {
     frames: u64,
     /// Pictures the scripts can draw ([`Surface::add_picture`]).
     pictures: screen::Pictures,
+    external_picture_revision: std::cell::Cell<u64>,
     /// Held-page buttons pinned open (`EVENTS`, `SCENE`, `PATTERN`…), kept across script
     /// reloads and saved in preferences.
     pinned: BTreeSet<String>,
@@ -1336,6 +1337,7 @@ impl Surface {
             filter_drawn: std::cell::Cell::new(false),
             frames: 0,
             pictures: Default::default(),
+            external_picture_revision: std::cell::Cell::new(0),
             pinned: BTreeSet::new(),
             shown_pin: None,
         };
@@ -1827,6 +1829,14 @@ impl Surface {
     pub fn add_picture(&self, key: &str, thumb: bool, w: usize, h: usize, px: Vec<[u8; 4]>) {
         if px.len() == w * h {
             self.pictures.borrow_mut().insert((key.to_string(), thumb), std::sync::Arc::new(screen::Image { w, h, px }));
+            self.pictures_changed.set(true);
+        }
+    }
+
+    /// Drop cached external assets on catalog refresh while retaining the app's built-ins.
+    pub fn refresh_external_pictures(&self, revision: u64, keep: &[&str]) {
+        if self.external_picture_revision.replace(revision) != revision {
+            self.pictures.borrow_mut().retain(|(key, _), _| keep.contains(&key.as_str()));
             self.pictures_changed.set(true);
         }
     }

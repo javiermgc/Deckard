@@ -4683,3 +4683,18 @@ fn render_browse_and_chain() {
     }
     assert_eq!(s.error(), None);
 }
+
+#[test]
+fn external_picture_revision_invalidates_only_external_assets() {
+    let s = Surface::new();
+    s.add_picture("builtin", true, 1, 1, vec![[1, 2, 3, 255]]);
+    s.add_picture("artwork:product", true, 1, 1, vec![[4, 5, 6, 255]]);
+    s.refresh_external_pictures(1, &["builtin"]);
+    assert!(s.has_picture("builtin", true));
+    assert!(!s.has_picture("artwork:product", true));
+    s.add_picture("artwork:product", true, 1, 1, vec![[4, 5, 6, 255]]);
+    s.refresh_external_pictures(1, &["builtin"]);
+    assert!(s.has_picture("artwork:product", true));
+    s.refresh_external_pictures(2, &["builtin"]);
+    assert!(!s.has_picture("artwork:product", true));
+}

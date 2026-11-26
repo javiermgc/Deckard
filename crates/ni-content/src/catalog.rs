@@ -82,6 +82,8 @@ pub struct DiscoveryIssue {
 }
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryReport {
+    /// Complete configuration scope; absent means a partial report cannot retire other providers.
+    pub sources: Option<Vec<String>>,
     pub installations: Vec<Installation>,
     pub complete_sources: Vec<String>,
     pub issues: Vec<DiscoveryIssue>,
@@ -100,12 +102,16 @@ pub fn discover(request: &DiscoveryRequest) -> DiscoveryReport {
     #[cfg(windows)]
     {
         let _ = request;
-        crate::windows::discover()
+        let mut report = crate::windows::discover();
+        report.sources = Some(vec!["windows64".into(), "windows32".into()]);
+        report
     }
     #[cfg(target_os = "macos")]
     {
         let _ = request;
-        crate::macos::discover(Path::new("/Library/Preferences"))
+        let mut report = crate::macos::discover(Path::new("/Library/Preferences"));
+        report.sources = Some(vec!["macos".into()]);
+        report
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {

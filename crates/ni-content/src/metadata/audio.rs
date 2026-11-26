@@ -96,7 +96,7 @@ fn item<R: Read + Seek>(
     let size = u64::from_le_bytes(h[..8].try_into().unwrap());
     let end = start.checked_add(size).filter(|e| *e <= limit && size >= 68).ok_or("invalid item size")?;
     let frame = bytes(r, start + 40, 20)?;
-    let frame_end = start + 40 + u64::from_le_bytes(frame[..8].try_into().unwrap());
+    let frame_end = (start + 40).checked_add(u64::from_le_bytes(frame[..8].try_into().unwrap())).ok_or("frame size overflow")?;
     if frame_end > end || frame_end < start + 60 {
         return Err("invalid frame size".into());
     }

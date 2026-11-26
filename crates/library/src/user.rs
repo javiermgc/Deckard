@@ -116,7 +116,7 @@ impl UserIndex {
     }
 
     /// Every indexed file's modification time, read once per scan.
-    fn known_mtimes(&self) -> Result<HashMap<String, i64>, String> {
+    pub(crate) fn known_mtimes(&self) -> Result<HashMap<String, i64>, String> {
         let mut st = self.db.prepare("SELECT path, mtime FROM items").map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
@@ -284,7 +284,7 @@ fn path_text(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn mtime(p: &Path) -> i64 {
+pub(crate) fn mtime(p: &Path) -> i64 {
     std::fs::metadata(p)
         .and_then(|m| m.modified())
         .ok()

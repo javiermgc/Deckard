@@ -29,7 +29,7 @@ fn native_index_reaches_browser_and_knob_touch_facets() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         browser.poll();
-        if !browser.scanning && !browser.waiting() {
+        if !browser.scanning && !browser.waiting() && browser.results.items.len() == 1 {
             break;
         }
         assert!(std::time::Instant::now() < deadline);
@@ -47,7 +47,8 @@ fn native_index_reaches_browser_and_knob_touch_facets() {
     surface.event(&deckard_mk3::Event::Button("BUTTON_BROWSE", true), &view, now);
     surface.event(&deckard_mk3::Event::Button("BUTTON_BROWSE", false), &view, now);
     surface.event(&deckard_mk3::Event::Button("BUTTON_CAP_5", true), &view, now);
-    assert!(surface.screen_picture(&view).unwrap().1.texts.contains(&"Kits".into()));
+    let picture = surface.screen_picture(&view).unwrap().1;
+    assert!(picture.text_labels().any(|text| text == "Kits"));
     browser.set_query(Query { kind: Kind::Group, types: vec!["Kits".into()], ..Default::default() });
     while browser.waiting() {
         browser.poll();
@@ -56,5 +57,33 @@ fn native_index_reaches_browser_and_knob_touch_facets() {
     }
     view.browser.attributes[1] = (browser.results.types.iter().map(|(s, _)| s.clone()).collect(), None);
     surface.event(&deckard_mk3::Event::Button("BUTTON_CAP_6", true), &view, now);
-    assert!(surface.screen_picture(&view).unwrap().1.texts.contains(&"Percussion".into()));
+    assert!(surface.screen_picture(&view).unwrap().1.text_labels().any(|text| text == "Percussion"));
+}
+#[test]
+fn favorite_and_saved_mutations_refresh_the_answer_without_another_action() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("User");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("Saved.wav");
+    std::fs::write(&path, b"RIFF\x04\0\0\0WAVE").unwrap();
+    let mut browser = Browser::default();
+    browser.start(None, t.path().join("db"), vec![]);
+    browser.set_query(Query { user: true, ..Default::default() });
+    browser.add_saved(&path);
+    browser.set_favorite(&path.to_string_lossy(), true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        browser.poll();
+        if browser.results.items.iter().any(|i| i.path == path && i.favorite) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "saved favorite never reached current answer");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    browser.set_favorite(&path.to_string_lossy(), false);
+    while browser.results.items[0].favorite {
+        browser.poll();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
