@@ -2315,6 +2315,7 @@ dependencies = [
  "cc",
  "deckard-mi",
  "deckard-model",
+ "deckard-ni-content",
  "libc",
  "libloading 0.8.9",
  "mxprj",

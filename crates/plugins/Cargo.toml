@@ -5,6 +5,7 @@ edition = "2024"
 description = "Hosts the VST3 plug-ins a Maschine project uses"
 
 [dependencies]
+deckard-ni-content = { path = "../ni-content" }
 deckard-mi = { path = "../mi" }
 vst3 = "0.3"
 serde_json = "1.0.154"

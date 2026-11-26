@@ -6,3 +6,7 @@ pub mod windows;
 pub mod wine;
 pub use catalog::*;
 pub use paths::wine_to_host;
+
+pub mod metadata;
+#[doc(hidden)]
+pub mod msgpack;

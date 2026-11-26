@@ -42,25 +42,7 @@ pub struct Preset {
     pub info: SoundInfo,
 }
 
-/// A preset's description (`NISI`): its name, where it's filed and its tags.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SoundInfo {
-    pub author: String,
-    /// Product, bank and sub-bank (three levels, empty where there's none).
-    pub bankchain: Vec<String>,
-    pub characters: Vec<String>,
-    pub comment: String,
-    /// `"INST"` or `"FX"`.
-    pub device_type: String,
-    /// Modes (a preset's playing styles, e.g. "Arp"; most have none).
-    pub modes: Vec<String>,
-    pub name: String,
-    /// Each a type and its sub-type.
-    pub types: Vec<Vec<String>>,
-    /// Lower-case, hyphenated (Maschine gives each preset it saves a random one).
-    pub uuid: String,
-    pub vendor: String,
-}
+pub use deckard_ni_content::metadata::NksSoundInfo as SoundInfo;
 
 /// Which plug-in a preset is for (`PLID`): its VST3 class (standard order) or VST2 id.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -138,32 +120,7 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, String> {
 
 /// A preset's description (`NISI` after its version number).
 fn parse_nisi(b: &[u8]) -> SoundInfo {
-    let Ok(Mp::Map(fields)) = (Reader { b, at: 0 }).value(0) else { return SoundInfo::default() };
-    let text = |v: &Mp| match v {
-        Mp::Str(s) => s.clone(),
-        _ => String::new(),
-    };
-    let texts = |v: &Mp| match v {
-        Mp::List(l) => l.iter().map(text).collect(),
-        _ => Vec::new(),
-    };
-    let mut info = SoundInfo::default();
-    for (key, v) in &fields {
-        match key.as_str() {
-            "author" => info.author = text(v),
-            "bankchain" => info.bankchain = texts(v),
-            "characters" => info.characters = texts(v),
-            "comment" => info.comment = text(v),
-            "deviceType" => info.device_type = text(v),
-            "modes" => info.modes = texts(v),
-            "name" => info.name = text(v),
-            "types" => info.types = if let Mp::List(l) = v { l.iter().map(texts).collect() } else { Vec::new() },
-            "uuid" => info.uuid = text(v),
-            "vendor" => info.vendor = text(v),
-            _ => {}
-        }
-    }
-    info
+    deckard_ni_content::metadata::read_nks_description(b).unwrap_or_default()
 }
 
 /// An NKS preset file as Maschine writes one when it saves a plug-in's preset
@@ -1063,107 +1020,7 @@ fn parse_dsiny_in(buf: &[u8]) -> Option<Vec<Vec<Knob>>> {
     parse()
 }
 
-/// A MessagePack value, as far as `PLID` needs one.
-enum Mp {
-    Int(i64),
-    Str(String),
-    List(Vec<Mp>),
-    Map(Vec<(String, Mp)>),
-    Other,
-}
-
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8], String> {
-        let end = self.at.checked_add(n).filter(|end| *end <= self.b.len()).ok_or("the preset's plug-in id is truncated")?;
-        let out = &self.b[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    /// An unsigned big-endian number of `n` bytes.
-    fn number(&mut self, n: usize) -> Result<u64, String> {
-        Ok(self.take(n)?.iter().fold(0u64, |v, b| (v << 8) | *b as u64))
-    }
-
-    fn text(&mut self, n: usize) -> Result<Mp, String> {
-        Ok(Mp::Str(String::from_utf8_lossy(self.take(n)?).into_owned()))
-    }
-
-    fn skip(&mut self, n: usize) -> Result<Mp, String> {
-        self.take(n)?;
-        Ok(Mp::Other)
-    }
-
-    fn list(&mut self, n: usize, depth: u8) -> Result<Mp, String> {
-        // (Not sized ahead: a truncated file can claim any length.)
-        let mut out = Vec::new();
-        for _ in 0..n {
-            out.push(self.value(depth + 1)?);
-        }
-        Ok(Mp::List(out))
-    }
-
-    fn map(&mut self, n: usize, depth: u8) -> Result<Mp, String> {
-        let mut out = Vec::new();
-        for _ in 0..n {
-            let key = match self.value(depth + 1)? {
-                Mp::Str(key) => key,
-                _ => String::new(),
-            };
-            out.push((key, self.value(depth + 1)?));
-        }
-        Ok(Mp::Map(out))
-    }
-
-    fn value(&mut self, depth: u8) -> Result<Mp, String> {
-        if depth > 8 {
-            return Err("the preset's plug-in id is nested too deeply".into());
-        }
-        let t = self.take(1)?[0];
-        match t {
-            0x00..=0x7f => Ok(Mp::Int(t as i64)),
-            0xe0..=0xff => Ok(Mp::Int(t as i8 as i64)),
-            0x80..=0x8f => self.map((t & 0x0f) as usize, depth),
-            0x90..=0x9f => self.list((t & 0x0f) as usize, depth),
-            0xa0..=0xbf => self.text((t & 0x1f) as usize),
-            0xc0 | 0xc2 | 0xc3 => Ok(Mp::Other),
-            0xc4..=0xc6 => {
-                let n = self.number(1 << (t - 0xc4))? as usize;
-                self.skip(n)
-            }
-            0xc7..=0xc9 => {
-                let n = self.number(1 << (t - 0xc7))? as usize;
-                self.skip(n.saturating_add(1))
-            }
-            0xca => self.skip(4),
-            0xcb => self.skip(8),
-            0xcc..=0xcf => Ok(Mp::Int(self.number(1 << (t - 0xcc))? as i64)),
-            0xd0 => Ok(Mp::Int(self.number(1)? as u8 as i8 as i64)),
-            0xd1 => Ok(Mp::Int(self.number(2)? as u16 as i16 as i64)),
-            0xd2 => Ok(Mp::Int(self.number(4)? as u32 as i32 as i64)),
-            0xd3 => Ok(Mp::Int(self.number(8)? as i64)),
-            0xd4..=0xd8 => self.skip((1usize << (t - 0xd4)) + 1),
-            0xd9..=0xdb => {
-                let n = self.number(1 << (t - 0xd9))? as usize;
-                self.text(n)
-            }
-            0xdc | 0xdd => {
-                let n = self.number(2 << (t - 0xdc))? as usize;
-                self.list(n, depth)
-            }
-            0xde | 0xdf => {
-                let n = self.number(2 << (t - 0xde))? as usize;
-                self.map(n, depth)
-            }
-            0xc1 => Err("the preset's plug-in id isn't valid".into()),
-        }
-    }
-}
+use deckard_ni_content::msgpack::{Mp, Reader};
 
 /// A preset file, for tests.
 #[doc(hidden)]
