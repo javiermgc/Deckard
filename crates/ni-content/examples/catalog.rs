@@ -1,2 +1,12 @@
 //! Explicit read-only diagnostic: cargo run -p deckard-ni-content --example catalog -- [prefix ...]
-fn main(){let request=deckard_ni_content::DiscoveryRequest::from_environment(std::env::args_os().skip(1).map(Into::into).collect()).expect("discovery configuration");let report=deckard_ni_content::discover(&request);for i in deckard_ni_content::select_installations(&report){println!("{}\t{:?}\t{}",i.name,i.availability,i.root.as_deref().map(|p|p.display().to_string()).unwrap_or_default());}for e in report.issues{eprintln!("{}: {}",e.source,e.message);}}
+fn main() {
+    let request = deckard_ni_content::DiscoveryRequest::from_environment(std::env::args_os().skip(1).map(Into::into).collect())
+        .expect("discovery configuration");
+    let report = deckard_ni_content::discover(&request);
+    for i in deckard_ni_content::select_installations(&report) {
+        println!("{}\t{:?}\t{}", i.name, i.availability, i.root.as_deref().map(|p| p.display().to_string()).unwrap_or_default());
+    }
+    for e in report.issues {
+        eprintln!("{}: {}", e.source, e.message);
+    }
+}

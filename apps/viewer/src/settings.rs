@@ -77,6 +77,7 @@ pub struct Settings {
     pub app_icon: crate::icon::Style,
     /// Preferences ▸ Library: folders of sound packs listed under Factory.
     pub library_folders: Vec<PathBuf>,
+    pub ni_wine_prefixes: Vec<PathBuf>,
     /// MIDI ports switched off (Preferences > MIDI): `in:<name>` and `out:<name>`.
     pub midi_off: BTreeSet<String>,
     /// MIDI inputs that are MPE controllers: port name → member pitch-bend range (±
@@ -381,6 +382,7 @@ impl Default for Settings {
             load_group_routing: true,
             load_group_patterns: true,
             library_folders: Vec::new(),
+            ni_wine_prefixes: Vec::new(),
             count_in_bars: 1,
             input_quantize: false,
             check_updates: true,
@@ -513,6 +515,7 @@ impl Settings {
                 "favorite_folder" => s.favorite_folders.push(PathBuf::from(v)),
                 "load_group_routing" => s.load_group_routing = v != "false",
                 "load_group_patterns" => s.load_group_patterns = v != "false",
+                "ni_wine_prefix" => s.ni_wine_prefixes.push(PathBuf::from(v)),
                 "library_folder" => s.library_folders.push(PathBuf::from(v)),
                 "count_in_bars" => s.count_in_bars = v.parse().unwrap_or(1),
                 "input_quantize" => s.input_quantize = v == "true",
@@ -874,6 +877,9 @@ impl Settings {
         }
         if self.app_icon != crate::icon::Style::default() {
             out += &format!("app_icon = {}\n", self.app_icon.key());
+        }
+        for d in &self.ni_wine_prefixes {
+            out += &format!("ni_wine_prefix = {}\n", d.display());
         }
         for d in &self.library_folders {
             out += &format!("library_folder = {}\n", d.display());

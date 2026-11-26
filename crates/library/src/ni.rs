@@ -184,6 +184,7 @@ impl NiIndex {
             let preview_subpath = preview_subpath(&path, content_root.as_deref(), upid.as_deref());
             let tempo = r.get::<_, Option<f64>>(3).map_err(err)?.filter(|t| *t > 0.0).or_else(|| crate::names::tempo_in_name(&name));
             let item = Item {
+                native_key: None,
                 vendor: vendor_str,
                 kind: q.kind,
                 user: q.user,
@@ -305,6 +306,7 @@ fn walk_unindexed_dir(dir: &Path, product: &str, fx_default: bool, out: &mut Vec
             let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
             let tempo = crate::names::tempo_in_name(&stem);
             out.push(Item {
+                native_key: None,
                 vendor: "Native Instruments".into(),
                 kind,
                 user: false,

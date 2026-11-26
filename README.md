@@ -586,3 +586,5 @@ LIBRARY tab and its "find it on Splice" line open splice.com through a referral 
 Splice pays DECKARD's author a commission on subscriptions started through it; it
 costs you nothing extra and changes nothing on Splice's side. The Splice name and logo
 are Splice's trademarks, used under its affiliate programme.
+
+See [Native Access library discovery and indexing](docs/native-access-libraries.md) for installation sources, supported metadata, refresh behavior and verification.

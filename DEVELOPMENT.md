@@ -624,3 +624,5 @@ What's still open lives in two lists:
 ## `out/`
 
 `out/` is git-ignored scratch space. Don't commit or redistribute anything in it.
+
+See [Native Access library discovery and indexing](docs/native-access-libraries.md) for installation sources, supported metadata, refresh behavior and verification.

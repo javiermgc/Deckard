@@ -47,4 +47,3 @@ pub fn read_nks_description(b: &[u8]) -> Result<NksSoundInfo, String> {
     }
     Ok(info)
 }
-

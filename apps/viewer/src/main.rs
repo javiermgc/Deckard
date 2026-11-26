@@ -41,6 +41,10 @@ mod controller;
 #[cfg(test)]
 mod controller_quality_tests;
 mod controller_timing;
+mod ni_library;
+mod ni_library_preferences;
+#[cfg(test)]
+mod ni_library_tests;
 /// The stem lane the bass is on ([`deckard_model::new_sampler::LANE_NAMES`]).
 const BASS_LANE: usize = 2;
 
@@ -1147,6 +1151,8 @@ pub struct App {
     catalog: settings::Catalog,
     /// The browser (LIBRARY / FILES), and the library it shows.
     browser: browser::Browser,
+    ni_library: ni_library::NiLibrary,
+    ni_sample_retry: Option<(deckard_doc::Shared, u64, std::sync::mpsc::Receiver<Vec<deckard_engine::PreloadedSamples>>)>,
     /// The browser preview being decoded, if any; the generation drops stale decodes.
     prehear_task: Option<(u64, std::sync::mpsc::Receiver<Result<deckard_engine::sample::Sample, String>>)>,
     prehear_generation: u64,
@@ -3500,8 +3506,9 @@ impl App {
                     ui.end_row();
                 });
             } else if tab == 5 {
+                self.native_library_preferences(ui);
                 ui.label("Folders of sound packs to list in the browser under Factory (each folder's name is its library).");
-                ui.add(egui::Label::new(egui::RichText::new("Maschine's own library is listed when it's installed; add packs here when it isn't.").weak()).wrap());
+                ui.add(egui::Label::new(egui::RichText::new("Add other sample packs here. Native Access installations are listed above.").weak()).wrap());
                 let mut remove = None;
                 for d in &self.settings.library_folders {
                     ui.horizontal(|ui| {
@@ -11250,6 +11257,15 @@ impl App {
     /// The sample search uses the same folders the library browser scans.
     fn remember_libraries(&mut self) {
         self.samples.library_dirs = self.library_roots().into_iter().map(|r| r.path).collect();
+        self.samples.library_dirs.extend(
+            self.ni_library
+                .snapshot
+                .as_ref()
+                .into_iter()
+                .flat_map(|s| deckard_ni_content::select_installations(&s.report))
+                .filter(|i| i.availability == deckard_ni_content::Availability::Available)
+                .filter_map(|i| i.root),
+        );
     }
 
     /// The folders DECKARD's library indexes: Maschine's user folders (Maschine 3's,
@@ -11604,9 +11620,8 @@ impl App {
         use browser::BrowseAct as B;
         self.browser.touch();
         if matches!(a, B::Rescan) {
-            let roots = self.library_roots();
-            self.browser.rescan(roots);
-            self.status = "Library refreshed".into();
+            self.refresh_native_libraries(true);
+            self.status = "Refreshing libraries…".into();
             return;
         }
         if let B::Folder(dir) = &a
@@ -11620,7 +11635,10 @@ impl App {
         match a {
             B::Toggle => {
                 b.open = !b.open;
-                if b.open && !b.started() {
+                if b.open {
+                    self.refresh_native_libraries(false);
+                }
+                if self.browser.open && !self.browser.started() {
                     let own = menu::settings_dir().map(|d| d.join("library.db3"));
                     let roots = self.library_roots();
                     if let Some(own) = own {
@@ -14163,6 +14181,7 @@ impl eframe::App for App {
     /// While the window is covered or minimized eframe runs no `ui`, only this: keep the
     /// controller (scripts, LEDs, screens) and MIDI going, as `frame` does when shown.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_native_libraries(ctx);
         if self.finish_quit(ctx) {
             return;
         }
@@ -14239,6 +14258,7 @@ impl App {
     /// One frame of the whole window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
+        self.poll_native_libraries(ctx);
         if self.finish_quit(ctx) {
             return;
         }
@@ -14379,6 +14399,7 @@ impl App {
             ctx.request_repaint_after(BACKGROUND_PACE);
         }
         self.menu_frame(ctx);
+        self.poll_native_libraries(ctx);
         if self.finish_quit(ctx) {
             return;
         }

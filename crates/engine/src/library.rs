@@ -18,16 +18,33 @@ pub struct Resolver {
     /// Folders the user added (Preferences ▸ Library), searched like installed libraries.
     extra: Vec<PathBuf>,
     roots: HashMap<String, Vec<PathBuf>>,
+    installed: Vec<PathBuf>,
+    revision: u64,
 }
 
 impl Resolver {
     pub fn new(project_path: Option<&Path>) -> Resolver {
-        Resolver { project_dir: project_path.and_then(Path::parent).map(Path::to_path_buf), extra: Vec::new(), roots: HashMap::new() }
+        Resolver {
+            project_dir: project_path.and_then(Path::parent).map(Path::to_path_buf),
+            extra: Vec::new(),
+            roots: HashMap::new(),
+            installed: Vec::new(),
+            revision: 0,
+        }
     }
 
     /// Also look in `dirs` (a library folder added in Preferences, an expansion's folder).
     pub fn set_extra(&mut self, dirs: &[PathBuf]) {
         self.extra = dirs.to_vec();
+    }
+
+    /// A discovery revision, supplied before resolving; negative root caches expire.
+    pub fn set_installed_content(&mut self, revision: u64, roots: &[PathBuf]) {
+        if self.revision != revision {
+            self.roots.clear();
+            self.revision = revision;
+        }
+        self.installed = roots.to_vec();
     }
 
     /// The local file for a sample reference, if one exists.
@@ -43,6 +60,7 @@ impl Resolver {
             return p.exists().then(|| p.to_path_buf());
         }
         let mut candidates = self.library_roots(&s.library).clone();
+        candidates.extend(self.installed.iter().cloned());
         candidates.extend(self.extra.iter().cloned());
         candidates.push(PathBuf::from(s.library_root.replace('\\', "/")));
         // The root recorded in the file is the machine that authored it
@@ -274,11 +292,7 @@ fn registry_sz(root: isize, subkey: &str, value: &str) -> Option<String> {
 /// `Macintosh HD:Users:Shared:X Library:` -> `/Users/Shared/X Library` (boot volume)
 /// or `/Volumes/<vol>/...` (other volumes). Both are returned when unsure.
 pub fn hfs_to_posix(hfs: &str) -> Vec<PathBuf> {
-    let mut parts = hfs.trim_end_matches(':').split(':');
-    let Some(volume) = parts.next() else { return Vec::new() };
-    let rest: Vec<&str> = parts.collect();
-    let rest = rest.join("/");
-    vec![PathBuf::from(format!("/{rest}")), PathBuf::from(format!("/Volumes/{volume}/{rest}"))]
+    vec![deckard_ni_content::paths::hfs_to_posix(hfs)]
 }
 
 #[cfg(test)]
@@ -318,7 +332,25 @@ mod tests {
     fn hfs_paths() {
         assert_eq!(
             hfs_to_posix("Macintosh HD:Users:Shared:Maschine 2 Library:"),
-            vec![PathBuf::from("/Users/Shared/Maschine 2 Library"), PathBuf::from("/Volumes/Macintosh HD/Users/Shared/Maschine 2 Library")]
+            vec![deckard_ni_content::paths::hfs_to_posix("Macintosh HD:Users:Shared:Maschine 2 Library:")]
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    #[test]
+    fn discovered_expansion_resolves_generic_maschine_reference_after_refresh() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Expansion");
+        std::fs::create_dir_all(root.join("Samples")).unwrap();
+        let wav = root.join("Samples/Hit.wav");
+        std::fs::write(&wav, b"sample").unwrap();
+        let sample = SampleRef { kind: 2, library: "Maschine 2.0 Library".into(), path: "Samples/Hit.wav".into(), ..Default::default() };
+        let mut resolver = Resolver::new(None);
+        assert!(resolver.resolve(&sample).is_none());
+        resolver.set_installed_content(1, &[root]);
+        assert_eq!(resolver.resolve(&sample), Some(wav));
     }
 }

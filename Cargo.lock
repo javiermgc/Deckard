@@ -2151,6 +2151,7 @@ dependencies = [
  "deckard-lua-host",
  "deckard-mk3",
  "deckard-model",
+ "deckard-ni-content",
  "deckard-nwl",
  "deckard-plugins",
  "deckard-stems",
@@ -2206,6 +2207,7 @@ dependencies = [
  "alsa",
  "cpal",
  "deckard-model",
+ "deckard-ni-content",
  "deckard-plugins",
  "deckard-stretch",
  "hound",
@@ -2229,8 +2231,11 @@ dependencies = [
 name = "deckard-library"
 version = "0.1.0"
 dependencies = [
+ "deckard-ni-content",
  "mxprj",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

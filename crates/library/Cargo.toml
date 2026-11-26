@@ -5,6 +5,9 @@ edition = "2024"
 description = "The browser's library: NI's index (read-only) and DECKARD's own"
 
 [dependencies]
+deckard-ni-content = { path = "../ni-content" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 mxprj = { path = "../mxprj" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 

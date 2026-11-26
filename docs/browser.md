@@ -105,3 +105,5 @@ The app hands over a `BrowserView` each frame; on a change the scripts get
 - Banks under products; product groups (by category / vendor).
 - Tag editing beyond the Save dialog; Quick Browse.
 - The cloud sample service (a separate project).
+
+See [Native Access library discovery and indexing](native-access-libraries.md) for installation sources, supported metadata, refresh behavior and verification.

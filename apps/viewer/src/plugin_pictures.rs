@@ -274,13 +274,40 @@ impl NiPictures {
     }
 }
 
-fn with_ni_pictures<R>(f: impl FnOnce(&mut NiPictures) -> R) -> R {
-    static NI: OnceLock<Mutex<NiPictures>> = OnceLock::new();
-    let root = ni_image_root();
-    let mut guard = NI.get_or_init(|| Mutex::new(NiPictures::scan(root.clone()))).lock().expect("ni pictures lock");
-    if guard.root != root {
-        *guard = NiPictures::scan(root);
+static NI: OnceLock<Mutex<NiPictures>> = OnceLock::new();
+
+/// Called by the catalog worker: enumerate and decode resource files off the UI thread.
+pub fn set_content_catalog(_revision: u64, installations: &[deckard_ni_content::Installation]) {
+    let mut roots = Vec::new();
+    if let Some(path) = std::env::var_os("DECKARD_NI_IMAGE_DIR") {
+        roots.push(PathBuf::from(path));
     }
+    for i in installations {
+        if let Some(root) = &i.root {
+            roots.push(root.join("PAResources/image"));
+        }
+    }
+    for i in installations {
+        roots.extend(i.image_roots.clone());
+    }
+    if let Some(root) = ni_image_root() {
+        roots.push(root);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ni = NiPictures::default();
+    for root in roots {
+        if seen.insert(root.clone()) {
+            NiPictures::walk(&root, 3, &mut ni);
+        }
+    }
+    let paths: Vec<_> = ni.by_name.values().flat_map(|e| [e.artwork.clone(), e.plugin.clone(), e.logo.clone()]).flatten().collect();
+    for path in paths {
+        ni.decode_cached(&path);
+    }
+    *NI.get_or_init(|| Mutex::new(NiPictures::default())).lock().expect("ni pictures lock") = ni;
+}
+fn with_ni_pictures<R>(f: impl FnOnce(&mut NiPictures) -> R) -> R {
+    let mut guard = NI.get_or_init(|| Mutex::new(NiPictures::default())).lock().expect("ni pictures lock");
     f(&mut guard)
 }
 

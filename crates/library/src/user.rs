@@ -39,7 +39,7 @@ pub fn documents() -> Option<PathBuf> {
 pub type Reader = fn(&Path) -> Option<Item>;
 
 pub struct UserIndex {
-    db: Connection,
+    pub(crate) db: Connection,
     reader: Option<Reader>,
 }
 
@@ -202,6 +202,7 @@ impl UserIndex {
                 let split = |s: String| s.split(LEVEL).filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>();
                 let path = PathBuf::from(r.get::<_, String>(0)?);
                 Ok(Item {
+                    native_key: None,
                     vendor: String::new(),
                     kind: q.kind,
                     user: q.user,

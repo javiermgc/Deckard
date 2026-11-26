@@ -2912,6 +2912,7 @@ pub struct SampleCache {
     by_path: HashMap<std::path::PathBuf, Option<Arc<Sample>>>,
     /// Library folders added in Preferences, searched with the installed ones.
     pub library_dirs: Vec<std::path::PathBuf>,
+    content_revision: u64,
     /// Where samples were found (by how the project refers to them, and the project's
     /// folder): each edit doesn't search the disk again. Only files found are kept.
     found: HashMap<FoundKey, std::path::PathBuf>,
@@ -2929,6 +2930,16 @@ pub struct SampleCache {
 }
 
 impl SampleCache {
+    /// Invalidate path/failed-decode caches when installation roots change.
+    pub fn set_installed_content(&mut self, revision: u64, roots: &[std::path::PathBuf]) {
+        if self.content_revision != revision {
+            self.content_revision = revision;
+            self.found.clear();
+            self.by_path.retain(|_, v| v.is_some());
+        }
+        self.library_dirs = roots.to_vec();
+    }
+
     /// The renders engines made with it asked for since last time: make them
     /// ([`render::RenderJob::run`], off the audio and UI threads), give them back with
     /// [`SampleCache::add_render`], and build the engine again to play them.

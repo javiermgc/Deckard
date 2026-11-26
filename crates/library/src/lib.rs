@@ -6,6 +6,9 @@
 //! Two sources: NI's own index (`komplete.db3`), read and never written ([`ni`]), and
 //! DECKARD's ([`user`]) of Maschine's user folders and what DECKARD saves.
 
+mod native_index;
+mod native_scan;
+pub use native_scan::{ScanProgress, ScanRequest};
 pub mod names;
 pub mod ni;
 pub mod products;
@@ -16,7 +19,7 @@ pub mod user;
 use std::path::PathBuf;
 
 /// A section of the LIBRARY tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Project,
     Group,
@@ -71,8 +74,10 @@ impl Kind {
 }
 
 /// One thing the library lists.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Item {
+    #[serde(default)]
+    pub native_key: Option<String>,
     pub vendor: String,
     pub kind: Kind,
     pub user: bool,
@@ -103,6 +108,9 @@ impl Item {
     /// Key used in DECKARD's `favorites` / `not_favorites` tables: `<path>#<uuid>` for
     /// ensemble containers so siblings don't collide, and bare `<path>` for single-file presets.
     pub fn favorite_key(&self) -> String {
+        if let Some(key) = &self.native_key {
+            return key.clone();
+        }
         match &self.uuid {
             Some(u) if !u.is_empty() && Self::is_ensemble_container(&self.path) => {
                 format!("{}#{u}", self.path.to_string_lossy())
@@ -185,6 +193,7 @@ impl Results {
 pub struct Library {
     ni: Option<ni::NiIndex>,
     own: user::UserIndex,
+    scan: Option<native_scan::Scanner>,
     /// Why NI's index isn't there, if it should be.
     pub ni_error: Option<String>,
 }
@@ -197,7 +206,9 @@ impl Library {
             Some(Err(e)) => (None, Some(e)),
             None => (None, None),
         };
-        Ok(Library { ni, own: user::UserIndex::open(own)?, ni_error })
+        let own = user::UserIndex::open(own)?;
+        native_index::initialize(&own.db)?;
+        Ok(Library { ni, own, ni_error, scan: None })
     }
 
     /// Both sources' results, one entry per file (DECKARD's when both list it), the
@@ -205,9 +216,9 @@ impl Library {
     /// kept in `ni_error`.
     pub fn query(&mut self, q: &Query) -> Results {
         let open = Query { favorites: false, ..q.clone() };
-        let own = self.own.query(&open).unwrap_or_default();
+        let own = self.own.query(&Query { kind: q.kind, user: q.user, ..Default::default() }).unwrap_or_default();
         let theirs = match &self.ni {
-            Some(ni) => match ni.query(&open) {
+            Some(ni) => match ni.query(&Query { kind: q.kind, user: q.user, ..Default::default() }) {
                 Ok(r) => {
                     self.ni_error = None;
                     r
@@ -224,9 +235,51 @@ impl Library {
         // snapshots, so key DECKARD's overrides by `<path>#<uuid>` and preserve NI's per-row
         // favorite status instead of merging by file path alone.
         let (favorites, not_favorites) = (self.own.favorite_keys(), self.own.not_favorite_keys());
-        let mine: std::collections::HashSet<&PathBuf> = own.items.iter().map(|i| &i.path).collect();
-        let mut items: Vec<Item> = theirs.items.into_iter().filter(|i| !mine.contains(&i.path)).collect();
-        items.extend(own.items);
+        let native = native_index::items(&self.own).unwrap_or_default();
+        let saved: std::collections::HashSet<_> = self
+            .own
+            .query(&Query { kind: q.kind, user: true, ..Default::default() })
+            .unwrap_or_default()
+            .items
+            .into_iter()
+            .map(|i| merge_key(&i))
+            .collect();
+        let owned = native_index::owned_roots(&self.own.db);
+        let mut merged = std::collections::BTreeMap::new();
+        for item in theirs.items {
+            merged.insert(merge_key(&item), item);
+        }
+        for mut item in native.into_iter().filter(|i| i.kind == q.kind && !saved.contains(&merge_key(i))) {
+            if let Some(old) = merged.get(&merge_key(&item)) {
+                if item.types.is_empty() {
+                    item.types = old.types.clone();
+                }
+                if item.characters.is_empty() {
+                    item.characters = old.characters.clone();
+                }
+                if item.bank.is_empty() {
+                    item.bank = old.bank.clone();
+                }
+                if item.vendor.is_empty() {
+                    item.vendor = old.vendor.clone();
+                }
+                if item.author.is_empty() {
+                    item.author = old.author.clone();
+                }
+                if item.tempo.is_none() {
+                    item.tempo = old.tempo;
+                }
+                item.favorite = old.favorite;
+                item.preview_subpath = old.preview_subpath.clone();
+            }
+            merged.insert(merge_key(&item), item);
+        }
+        for item in own.items {
+            if item.user || !owned.iter().any(|r| item.path.starts_with(r)) {
+                merged.insert(merge_key(&item), item);
+            }
+        }
+        let mut items: Vec<_> = merged.into_values().filter(|i| i.user == q.user && (q.user || !saved.contains(&merge_key(i)))).collect();
         for i in &mut items {
             let key = i.favorite_key();
             let legacy_key = i.uuid.as_deref().filter(|u| !u.is_empty()).is_some_and(|_| Item::is_ensemble_container(&i.path));
@@ -234,8 +287,15 @@ impl Library {
             let added = favorites.contains(&key) || (!legacy_key && favorites.contains(&*i.path.to_string_lossy()));
             i.favorite = !suppressed && (added || i.favorite);
         }
-        items.retain(|i| !q.favorites || i.favorite);
-        let products: std::collections::BTreeSet<String> = theirs.products.into_iter().chain(own.products).collect();
+        let products: std::collections::BTreeSet<String> = items
+            .iter()
+            .filter(|i| {
+                open.products.is_empty() || i.product.as_ref().is_some_and(|p| open.products.iter().any(|v| v.eq_ignore_ascii_case(p)))
+            })
+            .filter(|i| open.vendor.as_ref().is_none_or(|v| v.eq_ignore_ascii_case(&i.vendor)))
+            .filter_map(|i| i.product.clone())
+            .collect();
+        items.retain(|i| (q.product.is_none() || q.product == i.product) && q.admits(i));
         Results::of(items, q, products.into_iter().collect())
     }
 
@@ -283,4 +343,11 @@ impl Library {
     pub fn set_favorite_key(&mut self, key: &str, on: bool) {
         let _ = self.own.set_favorite_key(key, on);
     }
+}
+
+fn merge_key(item: &Item) -> (PathBuf, Option<String>) {
+    (
+        item.path.canonicalize().unwrap_or_else(|_| item.path.clone()),
+        if Item::is_ensemble_container(&item.path) { item.uuid.clone().filter(|u| !u.is_empty()) } else { None },
+    )
 }

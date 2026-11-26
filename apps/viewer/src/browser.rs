@@ -22,6 +22,7 @@ enum Job {
     Saved(PathBuf),
     Scan(Vec<Root>),
     Forget(PathBuf),
+    NativeScan(deckard_library::ScanRequest),
 }
 
 /// A query's answer: its number, the results, why NI's index isn't there, and, when
@@ -52,6 +53,11 @@ pub struct Browser {
     pub files_dir: PathBuf,
     pub files: Vec<Entry>,
     pub file_selected: Option<PathBuf>,
+    pub scan_status: String,
+    pub scanning: bool,
+    scan_progress: Option<mpsc::Receiver<deckard_library::ScanProgress>>,
+    scan_generation: u64,
+    discovery: deckard_ni_content::DiscoveryReport,
     worker: Option<(mpsc::Sender<Job>, mpsc::Receiver<Answer>)>,
     /// Moves on with every change (what the controller is shown follows it).
     rev: u64,
@@ -78,6 +84,11 @@ impl Default for Browser {
             files: Vec::new(),
             file_selected: None,
             worker: None,
+            scan_status: String::new(),
+            scanning: false,
+            scan_progress: None,
+            scan_generation: 0,
+            discovery: Default::default(),
             rev: 1,
             asked: 0,
             shown: 0,
@@ -98,6 +109,8 @@ impl Browser {
     pub fn start(&mut self, ni: Option<PathBuf>, own: PathBuf, roots: Vec<Root>) {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (tx, answers) = mpsc::channel::<Answer>();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        self.scan_progress = Some(progress_rx);
         std::thread::Builder::new()
             .name("library".into())
             .spawn(move || {
@@ -135,56 +148,92 @@ impl Browser {
                     };
                     tx.send((n, r, lib.ni_error.clone(), product)).is_ok()
                 };
-                // The last query answered. A folder walk that arrives on its own runs
-                // after it, then this query runs again so the new files show up.
                 let mut last: Option<(u64, Query)> = None;
-                while let Ok(mut job) = rx.recv() {
-                    loop {
-                        let (current, later) = split_query(job, &rx);
-                        if let Job::Query(n, q) = current {
-                            last = Some((n, q.clone()));
-                            if !reply(&mut lib, n, q) {
-                                return;
-                            }
-                            let again = !later.is_empty();
-                            for other in later {
-                                run(&mut lib, other);
-                            }
-                            if again {
-                                match rx.try_recv() {
-                                    Ok(next) => {
-                                        job = next;
-                                        continue;
+                let mut scanning = false;
+                let mut generation = 0;
+                loop {
+                    let job = if scanning {
+                        match rx.try_recv() {
+                            Ok(j) => Some(j),
+                            Err(mpsc::TryRecvError::Empty) => None,
+                            Err(_) => return,
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(j) => Some(j),
+                            Err(_) => return,
+                        }
+                    };
+                    if let Some(job) = job {
+                        let (job, later) = split_query(job, &rx);
+                        for job in std::iter::once(job).chain(later) {
+                            match job {
+                                Job::Query(n, q) => {
+                                    last = Some((n, q.clone()));
+                                    if !reply(&mut lib, n, q) {
+                                        return;
                                     }
-                                    Err(_) => {
-                                        if let Some((n, q)) = last.clone()
-                                            && !reply(&mut lib, n, q)
-                                        {
-                                            return;
+                                }
+                                Job::NativeScan(request) => {
+                                    generation = request.generation;
+                                    match lib.begin_scan(request) {
+                                        Ok(()) => scanning = true,
+                                        Err(e) => {
+                                            scanning = false;
+                                            let _ = progress_tx.send(deckard_library::ScanProgress {
+                                                generation,
+                                                finished: true,
+                                                issues: vec![e],
+                                                ..Default::default()
+                                            });
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            let scanned = matches!(current, Job::Scan(_));
-                            run(&mut lib, current);
-                            if scanned {
-                                match rx.try_recv() {
-                                    Ok(next) => {
-                                        job = next;
-                                        continue;
-                                    }
-                                    Err(_) => {
-                                        if let Some((n, q)) = last.clone()
-                                            && !reply(&mut lib, n, q)
-                                        {
-                                            return;
+                                Job::Scan(roots) => {
+                                    generation += 1;
+                                    match lib.begin_scan(deckard_library::ScanRequest {
+                                        generation,
+                                        discovery: Default::default(),
+                                        manual: roots,
+                                    }) {
+                                        Ok(()) => scanning = true,
+                                        Err(e) => {
+                                            scanning = false;
+                                            let _ = progress_tx.send(deckard_library::ScanProgress {
+                                                generation,
+                                                finished: true,
+                                                issues: vec![e],
+                                                ..Default::default()
+                                            });
                                         }
                                     }
                                 }
+                                other => run(&mut lib, other),
                             }
                         }
-                        break;
+                    }
+                    if scanning {
+                        match lib.scan_step(64) {
+                            Ok(progress) => {
+                                scanning = !progress.finished;
+                                let _ = progress_tx.send(progress);
+                            }
+                            Err(e) => {
+                                scanning = false;
+                                let _ = progress_tx.send(deckard_library::ScanProgress {
+                                    generation,
+                                    finished: true,
+                                    issues: vec![e],
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        if !scanning
+                            && let Some((n, q)) = last.clone()
+                            && !reply(&mut lib, n, q)
+                        {
+                            return;
+                        }
                     }
                 }
             })
@@ -194,7 +243,7 @@ impl Browser {
         // walk. That walk is Maschine's user folders and any library folders, and it
         // is what used to hold the installed expansions off the screen.
         self.refresh();
-        self.send(Job::Scan(roots));
+        self.rescan(roots);
     }
 
     pub fn started(&self) -> bool {
@@ -234,8 +283,22 @@ impl Browser {
 
     /// Scan `roots` again (Maschine's user folders, library folders).
     pub fn rescan(&mut self, roots: Vec<Root>) {
-        self.send(Job::Scan(roots));
+        self.scan_generation += 1;
+        self.scanning = true;
+        self.scan_status = "Indexing libraries…".into();
+        self.send(Job::NativeScan(deckard_library::ScanRequest {
+            generation: self.scan_generation,
+            discovery: self.discovery.clone(),
+            manual: roots,
+        }));
         self.refresh();
+    }
+
+    pub fn set_content_catalog(&mut self, report: deckard_ni_content::DiscoveryReport, roots: Vec<Root>) {
+        self.discovery = report;
+        if self.started() {
+            self.rescan(roots);
+        }
     }
 
     /// Drop what's listed from under `dir` (a library folder taken out).
@@ -245,6 +308,23 @@ impl Browser {
 
     /// Take up results that came in; true when they changed.
     pub fn poll(&mut self) -> bool {
+        if let Some(rx) = &self.scan_progress {
+            while let Ok(progress) = rx.try_recv() {
+                if progress.generation != self.scan_generation {
+                    continue;
+                }
+                self.scanning = !progress.finished;
+                self.scan_status = if progress.finished {
+                    if progress.issues.is_empty() {
+                        format!("Library refreshed ({} files)", progress.processed)
+                    } else {
+                        format!("Library refresh finished with {} issues: {}", progress.issues.len(), progress.issues[0])
+                    }
+                } else {
+                    format!("Indexing libraries… {} files", progress.processed)
+                };
+            }
+        }
         let Some((_, answers)) = &self.worker else { return false };
         let mut newest = None;
         while let Ok(a) = answers.try_recv() {
@@ -382,7 +462,7 @@ fn run(lib: &mut Library, job: Job) {
             let _ = lib.scan(&roots);
         }
         Job::Forget(dir) => lib.forget(&dir),
-        Job::Query(..) => {}
+        Job::Query(..) | Job::NativeScan(..) => {}
     }
 }
 
@@ -445,7 +525,8 @@ pub fn can_prehear(item: &Item) -> bool {
 /// effect, the preview Maschine keeps beside it (`.previews/<file name>.ogg`, or a `.wav`
 /// preview in `.previews/`, as Save Sound writes: [`preview_path`]) when there is one.
 pub fn prehear_file(item: &Item) -> Option<PathBuf> {
-    prehear_file_with_nbpl(item, nbpl_samples_dir())
+    let roots = NBPL.get_or_init(Default::default).lock().expect("preview catalog").clone();
+    prehear_file_with_nbpl(item, None).or_else(|| roots.iter().find_map(|root| prehear_file_with_nbpl(item, Some(root))))
 }
 
 pub(crate) fn prehear_file_with_nbpl(item: &Item, nbpl_samples: Option<&Path>) -> Option<PathBuf> {
@@ -488,50 +569,17 @@ fn preview_in_dir(previews: &Path, name: &str, stem: Option<&str>, uuid: Option<
     wav_stem.is_file().then_some(wav_stem)
 }
 
-fn nbpl_samples_dir() -> Option<&'static Path> {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(find_nbpl_samples_dir).as_deref()
-}
-
-#[cfg(windows)]
-fn find_nbpl_samples_dir() -> Option<PathBuf> {
-    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-    let val = wide("ContentDir");
-    for subkey in [
-        "SOFTWARE\\Native Instruments\\Native Browser Preview Library",
-        "SOFTWARE\\WOW6432Node\\Native Instruments\\Native Browser Preview Library",
-    ] {
-        let subkey_w = wide(subkey);
-        let mut buf = [0u16; 4096];
-        let mut size = (buf.len() * 2) as u32;
-        let rc = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                subkey_w.as_ptr(),
-                val.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buf.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        if rc == 0 {
-            let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
-            if len > 0 {
-                let samples = PathBuf::from(String::from_utf16_lossy(&buf[..len])).join("Samples");
-                if samples.is_dir() {
-                    return Some(samples);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(windows))]
-fn find_nbpl_samples_dir() -> Option<PathBuf> {
-    None
+static NBPL: OnceLock<std::sync::Mutex<Vec<PathBuf>>> = OnceLock::new();
+/// Called by discovery on its worker; a new revision replaces cached misses too.
+pub fn set_content_catalog(_revision: u64, installations: &[deckard_ni_content::Installation]) {
+    let roots = installations
+        .iter()
+        .filter(|i| i.name.eq_ignore_ascii_case("Native Browser Preview Library"))
+        .filter_map(|i| i.root.as_ref())
+        .map(|p| p.join("Samples"))
+        .filter(|p| p.is_dir())
+        .collect();
+    *NBPL.get_or_init(Default::default).lock().expect("preview catalog") = roots;
 }
 
 /// Where the audio preview of the sound, group, instrument or effect file `file` goes:
