@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Read-only installed NI content discovery and portable metadata"
 [dependencies]
+quick-xml = "0.41"
 plist = "1"
 mxprj = { path = "../mxprj" }
 toml = "0.9"

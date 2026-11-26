@@ -2289,6 +2289,7 @@ version = "0.1.0"
 dependencies = [
  "mxprj",
  "plist",
+ "quick-xml 0.41.0",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "windows-sys 0.59.0",

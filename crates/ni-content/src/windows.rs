@@ -18,6 +18,10 @@ pub fn from_registrations(source: &str, rows: Vec<Registration>) -> DiscoveryRep
     r.complete_sources.push(source.into());
     r
 }
+/// Common-files roots are supplied by the platform so redirected installations work.
+pub fn host_image_roots(common_files: &[PathBuf]) -> Vec<PathBuf> {
+    common_files.iter().map(|root| root.join("Native Instruments/Komplete Kontrol/PAResources/image")).collect()
+}
 #[cfg(windows)]
 pub fn discover() -> DiscoveryReport {
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND};
@@ -80,6 +84,15 @@ pub fn discover() -> DiscoveryReport {
             for i in &mut part.installations {
                 i.image_roots.push(PathBuf::from(&public).join("Documents/NI Resources/image"));
             }
+        }
+        let common_files: Vec<_> = ["CommonProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        for i in &mut part.installations {
+            i.fallback_image_roots = host_image_roots(&common_files);
         }
         report.extend(part);
     }

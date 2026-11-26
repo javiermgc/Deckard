@@ -43,3 +43,17 @@ Native files without a supported metadata reader remain inventory-only. Internal
 7. Kept native Windows/macOS, actual hardware and plug-in playback verification explicitly unclaimed, consistent with the reviewer's declined-to-judge list. Risk: platform-specific runtime issues require testing on those hosts.
 
 No review findings were deferred as minor issues. The branch is retained locally as requested; no PR consent was requested or inferred.
+
+## Artwork fallback correction (2026-11-26)
+
+Massive's installed artwork was in Komplete Kontrol's optional bundled resources, outside the previous search roots. Ozone's registration name includes its vendor, while its artwork directory does not. The resolver now preserves all existing directory/key matches, then tries explicit `.meta` name/vendor aliases, and only then host-bundled artwork. No generic vendor stripping or dependency on Komplete Kontrol/Maschine is introduced.
+
+Validation for this correction:
+
+- Content and library suites: 68 tests passed.
+- Artwork fallback tests: 2 synthetic regressions plus 1 opt-in read-only live test passed. Both Massive and iZotope-Ozone 12 Equalizer resolve and decode thumbnails/logos for the browser and plug-in slots using the installed Wine assets. Existing matches and metadata aliases beat host fallbacks; an unrelated vendor does not match.
+- Existing resource-resolution regression: 1 test passed; native library UI integration: 3 tests passed.
+- Windows discovery cross-check (`x86_64-pc-windows-msvc`) passed. Windows common-files path fixtures, macOS plist discovery, and Wine case-insensitive mapped-drive fixtures passed. Native Windows/macOS runtime testing remains pending.
+- Metadata is bounded to 64 KiB and malformed/non-image metadata is ignored. Resources remain read-only and are decoded on the catalog worker.
+
+Repeat the installed-assets check with `DECKARD_TEST_WINE_PREFIX=/path/to/prefix cargo test -p deckard installed_massive_and_ozone_artwork --locked -- --ignored --nocapture`. It does not launch the app or modify preferences, library databases, or NI files.

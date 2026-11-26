@@ -79,6 +79,8 @@ struct NiPictures {
     by_name: HashMap<String, Entry>,
     by_key: HashMap<String, Entry>,
     decoded: HashMap<PathBuf, DecodedImage>,
+    aliases: HashMap<String, Entry>,
+    fallback: Option<Box<NiPictures>>,
 }
 
 fn ni_image_root() -> Option<PathBuf> {
@@ -139,6 +141,29 @@ impl NiPictures {
                     let clean = strip_hash(&lower).trim().to_string();
                     ni.by_name.entry(lower).or_default().merge(&entry);
                     ni.by_name.entry(clean.clone()).or_default().merge(&entry);
+                    // Metadata aliases are deliberately separate from normal name/key lookup.
+                    let mut metadata: Vec<_> = std::fs::read_dir(&path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|e| e == "meta"))
+                        .collect();
+                    metadata.sort();
+                    for file in metadata {
+                        use std::io::Read;
+                        let Ok(file) = std::fs::File::open(file) else { continue };
+                        let mut bytes = Vec::new();
+                        if file.take(65537).read_to_end(&mut bytes).is_err() {
+                            continue;
+                        }
+                        if let Some(aliases) = deckard_ni_content::resources::image_aliases(&bytes) {
+                            for alias in aliases {
+                                let key = deckard_lua_host::plugin_picture_key(&alias);
+                                ni.aliases.entry(key).or_default().merge(&entry);
+                            }
+                        }
+                    }
                     for k in candidate_keys(&clean) {
                         ni.by_key.entry(k).or_default().merge(&entry);
                     }
@@ -162,6 +187,8 @@ impl NiPictures {
             }
         }
         found
+            .or_else(|| self.aliases.get(&deckard_lua_host::plugin_picture_key(&lower)).cloned())
+            .or_else(|| self.fallback.as_ref().and_then(|fallback| fallback.lookup(name)))
     }
 
     fn decode_cached(&mut self, path: &Path) -> DecodedImage {
@@ -233,6 +260,12 @@ pub fn set_content_catalog(revision: u64, installations: &[deckard_ni_content::I
     if let Some(root) = ni_image_root() {
         roots.push(root);
     }
+    let fallback_roots: Vec<_> = installations.iter().flat_map(|i| i.fallback_image_roots.clone()).collect();
+    let ni = catalog_pictures(revision, &roots, &fallback_roots);
+    *NI.get_or_init(|| Mutex::new(NiPictures::default())).lock().expect("ni pictures lock") = ni;
+}
+
+fn catalog_pictures(revision: u64, roots: &[PathBuf], fallback_roots: &[PathBuf]) -> NiPictures {
     let mut seen = std::collections::HashSet::new();
     let mut ni = NiPictures { revision, ..Default::default() };
     for root in roots {
@@ -240,11 +273,24 @@ pub fn set_content_catalog(revision: u64, installations: &[deckard_ni_content::I
             NiPictures::walk(&root, 3, &mut ni);
         }
     }
-    let paths: Vec<_> = ni.by_name.values().flat_map(|e| [e.artwork.clone(), e.plugin.clone(), e.logo.clone()]).flatten().collect();
+    let mut fallback = NiPictures::default();
+    for root in fallback_roots {
+        if seen.insert(root.clone()) {
+            NiPictures::walk(root, 3, &mut fallback);
+        }
+    }
+    let paths: Vec<_> = ni
+        .by_name
+        .values()
+        .chain(fallback.by_name.values())
+        .flat_map(|e| [e.artwork.clone(), e.plugin.clone(), e.logo.clone()])
+        .flatten()
+        .collect();
     for path in paths {
         ni.decode_cached(&path);
     }
-    *NI.get_or_init(|| Mutex::new(NiPictures::default())).lock().expect("ni pictures lock") = ni;
+    ni.fallback = Some(Box::new(fallback));
+    ni
 }
 fn with_ni_pictures<R>(f: impl FnOnce(&mut NiPictures) -> R) -> R {
     let mut guard = NI.get_or_init(|| Mutex::new(NiPictures::default())).lock().expect("ni pictures lock");
@@ -272,4 +318,82 @@ fn decode(bytes: &[u8]) -> Option<(usize, usize, Vec<[u8; 4]>)> {
 fn refresh_surface(surface: &deckard_surface::Surface) {
     let revision = with_ni_pictures(|ni| ni.revision);
     surface.refresh_external_pictures(revision, &PICTURES.iter().map(|(key, ..)| *key).collect::<Vec<_>>());
+}
+
+#[cfg(test)]
+mod artwork_fallback_tests {
+    use super::*;
+
+    fn artwork(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("MST_artwork.png");
+        std::fs::write(&path, PICTURES[0].1).unwrap();
+        path
+    }
+
+    #[test]
+    fn vendor_metadata_alias_is_only_a_fallback() {
+        let t = tempfile::tempdir().unwrap();
+        let aliased = artwork(t.path(), "izotope/ozone 12 equalizer");
+        std::fs::write(
+            aliased.parent().unwrap().join("ozone.meta"),
+            b"<resource><vendor>iZotope</vendor><name>Ozone 12 Equalizer</name><type>image</type></resource>",
+        )
+        .unwrap();
+        let mut ni = catalog_pictures(1, &[t.path().into()], &[]);
+        assert_eq!(ni.lookup("iZotope-Ozone 12 Equalizer").unwrap().artwork, Some(aliased.clone()));
+        let surface = deckard_surface::Surface::new();
+        assert!(ni.load_browser_product(&surface, "izotope-ozone 12 equalizer", "ozone"));
+        assert!(surface.has_picture("ozone", true) && surface.has_picture("ozone", false));
+        assert!(ni.lookup("AnotherVendor-Ozone 12 Equalizer").is_none());
+        let exact = artwork(t.path(), "iZotope-Ozone 12 Equalizer");
+        let ni = catalog_pictures(2, &[t.path().into()], &[]);
+        assert_eq!(ni.lookup("iZotope-Ozone 12 Equalizer").unwrap().artwork, Some(exact));
+        assert_eq!(ni.lookup("Ozone 12 Equalizer").unwrap().artwork, Some(aliased));
+    }
+
+    #[test]
+    fn host_resources_never_override_existing_artwork_or_aliases() {
+        let t = tempfile::tempdir().unwrap();
+        let primary = t.path().join("primary");
+        let host = t.path().join("host");
+        let fallback = artwork(&host, "Massive");
+        let mut ni = catalog_pictures(1, &[primary.clone()], &[host.clone()]);
+        assert_eq!(ni.lookup("Massive").unwrap().artwork, Some(fallback));
+        let surface = deckard_surface::Surface::new();
+        assert!(ni.load_browser_product(&surface, "massive", "massive"));
+        let exact = artwork(&primary, "Massive");
+        let alias = artwork(&primary, "ozone");
+        std::fs::write(
+            alias.parent().unwrap().join("ozone.meta"),
+            b"<resource><vendor>iZotope</vendor><name>Ozone 12 Equalizer</name><type>image</type></resource>",
+        )
+        .unwrap();
+        artwork(&host, "iZotope-Ozone 12 Equalizer");
+        let ni = catalog_pictures(2, &[primary], &[host]);
+        assert_eq!(ni.lookup("Massive").unwrap().artwork, Some(exact));
+        assert_eq!(ni.lookup("iZotope-Ozone 12 Equalizer").unwrap().artwork, Some(alias));
+    }
+
+    /// Read-only check against installed assets; no app, preferences, or index writes.
+    #[test]
+    #[ignore = "requires installed NI content; set DECKARD_TEST_WINE_PREFIX on Linux"]
+    fn installed_massive_and_ozone_artwork() {
+        let explicit = std::env::var_os("DECKARD_TEST_WINE_PREFIX").map(PathBuf::from).into_iter().collect();
+        let request = deckard_ni_content::DiscoveryRequest::from_environment(explicit).unwrap();
+        let report = deckard_ni_content::discover(&request);
+        let installations = deckard_ni_content::select_installations(&report);
+        let roots: Vec<_> = installations.iter().flat_map(|i| i.image_roots.clone()).collect();
+        let fallback_roots: Vec<_> = installations.iter().flat_map(|i| i.fallback_image_roots.clone()).collect();
+        let mut ni = catalog_pictures(1, &roots, &fallback_roots);
+        let surface = deckard_surface::Surface::new();
+        for name in ["Massive", "iZotope-Ozone 12 Equalizer"] {
+            let entry = ni.lookup(name).unwrap_or_else(|| panic!("no artwork for {name}"));
+            eprintln!("{name}: {}", entry.artwork.as_ref().unwrap().display());
+            assert!(ni.load_browser_product(&surface, name, name));
+            assert!(surface.has_picture(name, true) && surface.has_picture(name, false));
+            assert!(ni.load_slot(&surface, name, &format!("slot:{name}")));
+        }
+    }
 }

@@ -53,6 +53,8 @@ pub struct Installation {
     pub availability: Availability,
     pub source: String,
     pub image_roots: Vec<PathBuf>,
+    /// Host-bundled resources, searched only after normal roots and metadata aliases.
+    pub fallback_image_roots: Vec<PathBuf>,
 }
 impl Installation {
     pub fn registered(source: &str, name: &str, root: Option<PathBuf>, version: Option<String>) -> Self {
@@ -72,6 +74,7 @@ impl Installation {
             availability,
             source: source.into(),
             image_roots,
+            fallback_image_roots: Vec::new(),
         }
     }
 }

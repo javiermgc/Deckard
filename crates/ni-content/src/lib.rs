@@ -10,3 +10,5 @@ pub use paths::wine_to_host;
 pub mod metadata;
 #[doc(hidden)]
 pub mod msgpack;
+
+pub mod resources;

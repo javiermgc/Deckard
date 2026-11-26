@@ -10,6 +10,10 @@ pub fn read_plist(name: &str, bytes: &[u8]) -> Result<Option<Installation>, Stri
     }
     Ok(Some(Installation::registered("macos", name, Some(root), dict.get("ContentVersion").and_then(|v| v.as_string()).map(str::to_owned))))
 }
+/// Host resources are optional: discovering content never requires Komplete Kontrol.
+pub fn host_image_roots() -> Vec<std::path::PathBuf> {
+    vec!["/Library/Application Support/Native Instruments/Komplete Kontrol/PAResources/image".into()]
+}
 pub fn discover(preferences: &Path) -> DiscoveryReport {
     let mut report = DiscoveryReport::default();
     let mut complete = true;
@@ -30,6 +34,7 @@ pub fn discover(preferences: &Path) -> DiscoveryReport {
                 match std::fs::read(entry.path()).map_err(|e| e.to_string()).and_then(|b| read_plist(name, &b)) {
                     Ok(Some(mut i)) => {
                         i.image_roots.push("/Users/Shared/NI Resources/image".into());
+                        i.fallback_image_roots = host_image_roots();
                         report.installations.push(i);
                     }
                     Ok(None) => {}

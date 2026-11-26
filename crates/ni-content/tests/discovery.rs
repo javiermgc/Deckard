@@ -110,3 +110,61 @@ fn same_product_copies_select_first_available() {
     let r = DiscoveryReport { installations: vec![a, b.clone()], ..Default::default() };
     assert_eq!(select_installations(&r), vec![b]);
 }
+
+#[test]
+fn platform_host_artwork_paths_are_separate_fallbacks() {
+    let roots = windows::host_image_roots(&[PathBuf::from("C:/Program Files/Common Files"), PathBuf::from("D:/Common")]);
+    assert_eq!(
+        roots,
+        vec![
+            PathBuf::from("C:/Program Files/Common Files/Native Instruments/Komplete Kontrol/PAResources/image"),
+            PathBuf::from("D:/Common/Native Instruments/Komplete Kontrol/PAResources/image"),
+        ]
+    );
+    assert_eq!(
+        macos::host_image_roots(),
+        vec![PathBuf::from("/Library/Application Support/Native Instruments/Komplete Kontrol/PAResources/image")]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wine_host_artwork_fallback_stays_inside_selected_prefix() {
+    let t = tempfile::tempdir().unwrap();
+    let prefix = t.path().join("wine");
+    std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+    let drive = t.path().join("mapped_c");
+    std::fs::create_dir_all(drive.join("program files/Common Files/Native Instruments/Komplete Kontrol/PAResources/image/Massive"))
+        .unwrap();
+    std::os::unix::fs::symlink(&drive, prefix.join("dosdevices/c:")).unwrap();
+    std::fs::write(
+        prefix.join("system.reg"),
+        r#"WINE REGISTRY Version 2
+[Software\\Native Instruments\\Massive] 1
+"ContentDir"="C:\\Libraries\\Massive"
+[Software\\Native Instruments\\Komplete Kontrol] 1
+"InstallDir"="C:\\Program Files\\Native Instruments\\Komplete Kontrol"
+"#,
+    )
+    .unwrap();
+    let report = wine::read_prefix(&prefix);
+    assert_eq!(report.installations.len(), 1, "host resource fallback must not add a content library");
+    let i = &report.installations[0];
+    let expected = drive.join("program files/Common Files/Native Instruments/Komplete Kontrol/PAResources/image");
+    assert!(i.fallback_image_roots.contains(&expected));
+    assert!(!i.image_roots.contains(&expected));
+}
+
+#[test]
+fn macos_discovery_keeps_host_images_out_of_primary_roots() {
+    let t = tempfile::tempdir().unwrap();
+    let mut dict = plist::Dictionary::new();
+    dict.insert("ContentDir".into(), plist::Value::String("/Library/Example Content/Massive".into()));
+    plist::Value::Dictionary(dict).to_file_xml(t.path().join("com.native-instruments.Massive.plist")).unwrap();
+    let report = macos::discover(t.path());
+    assert!(report.issues.is_empty());
+    assert_eq!(report.installations.len(), 1);
+    let i = &report.installations[0];
+    assert_eq!(i.fallback_image_roots, macos::host_image_roots());
+    assert!(i.image_roots.iter().all(|p| !i.fallback_image_roots.contains(p)));
+}

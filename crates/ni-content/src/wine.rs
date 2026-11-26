@@ -128,6 +128,14 @@ pub fn read_prefix(prefix: &Path) -> DiscoveryReport {
             }
         }
     }
+    // Resolve with this prefix's drive mappings and case rules, never the host OS paths.
+    let fallback_roots: Vec<_> = [
+        r"C:\Program Files\Common Files\Native Instruments\Komplete Kontrol\PAResources\image",
+        r"C:\Program Files (x86)\Common Files\Native Instruments\Komplete Kontrol\PAResources\image",
+    ]
+    .into_iter()
+    .filter_map(|path| wine_to_host(prefix, path).ok())
+    .collect();
     for (name, dir, version) in entries {
         let Some(dir) = dir.filter(|s| !s.is_empty()) else { continue };
         let root = match wine_to_host(prefix, &dir) {
@@ -141,6 +149,7 @@ pub fn read_prefix(prefix: &Path) -> DiscoveryReport {
         if let Ok(shared) = wine_to_host(prefix, "C:\\Users\\Public\\Documents\\NI Resources\\image") {
             i.image_roots.push(shared);
         }
+        i.fallback_image_roots = fallback_roots.clone();
         report.installations.push(i);
     }
     if complete {
